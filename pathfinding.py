@@ -234,7 +234,7 @@ def plan_trajectory(start: Position, goal: Position, start_time: float) -> Optio
     start_node.f = start_node.h
     
     iterations = 0
-    max_iterations = 300000  # Prevent infinite loops
+    max_iterations = 200000  # Prevent infinite loops
     print("START:", start)
     print("GOAL:", goal)
 
@@ -279,7 +279,7 @@ def plan_trajectory(start: Position, goal: Position, start_time: float) -> Optio
             neighbor.parent = current
             heapq.heappush(open_set, neighbor)
                 
-    
+    print("A* failed after", iterations, "iterations")
     # No path found
     return None
 

@@ -257,7 +257,7 @@ async def create_delivery_request(request: DeliveryRequest):
                 # Broadcast conflict resolution
                 await manager.broadcast({
                     'type': 'conflict_resolved',
-                    'conflict': conflict.dict(),
+                    'conflict': conflict.model_dump(),
                     'resolution_method': method
                 })
         
@@ -272,7 +272,7 @@ async def create_delivery_request(request: DeliveryRequest):
         # Broadcast mission created
         await manager.broadcast({
             'type': 'mission_created',
-            'mission': mission.dict()
+            'mission': mission.model_dump()
         })
         
         return {
@@ -308,7 +308,7 @@ async def update_telemetry(telemetry: Telemetry):
     # Broadcast telemetry update
     await manager.broadcast({
         'type': 'telemetry',
-        'data': telemetry.dict()
+        'data': telemetry.model_dump()
     })
     
     return {"status": "ok"}
@@ -324,6 +324,16 @@ async def get_drone(drone_id: str):
     if drone_id not in active_drones:
         raise HTTPException(404, "Drone not found")
     return active_drones[drone_id]
+
+@app.get("/geofence")
+async def get_geofence():
+    """Returns no-fly zones for the frontend map"""
+    return {
+        "no_fly_zones": [z['polygon'] for z in config.NO_FLY_ZONES],
+        "sensitive_areas": [z['polygon'] for z in config.SENSITIVE_AREAS],
+        "operational_area": config.OPERATIONAL_AREA
+    }
+
 
 @app.post("/api/drones/{drone_id}/register")
 async def register_drone(drone_id: str, position: Position):
@@ -345,7 +355,7 @@ async def register_drone(drone_id: str, position: Position):
     
     await manager.broadcast({
         'type': 'drone_registered',
-        'drone': telemetry.dict()
+        'drone': telemetry.model_dump()
     })
     
     return {"status": "registered", "drone_id": drone_id}
@@ -359,8 +369,8 @@ async def websocket_endpoint(websocket: WebSocket):
         # Send initial state
         await websocket.send_json({
             'type': 'initial_state',
-            'drones': [d.dict() for d in active_drones.values()],
-            'missions': [m.dict() for m in active_missions.values()],
+            'drones': [d.model_dump() for d in active_drones.values()],
+            'missions': [m.model_dump() for m in active_missions.values()],
             'geofencing': geofencing.get_geofence_info()
         })
         
