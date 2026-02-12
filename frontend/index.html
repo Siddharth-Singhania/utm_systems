@@ -647,11 +647,11 @@
         };
         
         // Cesium Configuration
-        Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI5N2UyMjcwOS00MDY1LTQxYjEtYjZjMy00YTU0ZTg1YmFjYWEiLCJpZCI6ODE5MjQsImlhdCI6MTY0MzI0ODMxMn0.ipgVLm1pJa4MqBuTN74UhPRlGXn5EsXuqmEpBJW-OUs';
+        Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI1ZWQ4NmZjZS1hMGVkLTQzNjYtYTIwZi1kYWFmMDM2NmYzZTIiLCJpZCI6MzkwMDE1LCJpYXQiOjE3NzA5MDQ5MTJ9.oMikqljPMbCSIgEWEdCwZZnJyFDDLDU4RUYYpUrXxMI';
         
         // Initialize Cesium Viewer
         const viewer = new Cesium.Viewer('cesiumContainer', {
-            terrainProvider: Cesium.createWorldTerrain(),
+            terrain: Cesium.Terrain.fromWorldTerrain(),
             baseLayerPicker: false,
             geocoder: false,
             homeButton: false,

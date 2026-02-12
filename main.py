@@ -12,7 +12,8 @@ import asyncio
 import json
 import time
 import uuid
-
+import os
+import logging
 from models import (
     DeliveryRequest, Mission, Telemetry, DroneStatus,
     Position, Trajectory, ConflictAlert, SystemStatus
@@ -31,7 +32,8 @@ app = FastAPI(
     description="Unmanned Traffic Management for Autonomous Drone Delivery",
     version="1.0.0"
 )
-
+if os.path.exists("frontend"):
+    app.mount("/static", StaticFiles(directory="frontend"), name="static")
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -99,15 +101,21 @@ manager = ConnectionManager()
 # ============================================================================
 # API ENDPOINTS
 # ============================================================================
-
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 @app.get("/")
 async def root():
-    """Serve the frontend HTML"""
-    try:
-        with open('frontend/index.html', 'r') as f:
-            return HTMLResponse(content=f.read())
-    except FileNotFoundError:
-        return {"message": "UTM System API is running. Frontend not found."}
+    """Serve the frontend HTML using an absolute path"""
+    frontend_path = os.path.join(BASE_DIR, "frontend", "index.html")
+    
+    if os.path.exists(frontend_path):
+        return FileResponse(frontend_path)
+    
+    # If file is missing, return a clear JSON error instead of a 500 crash
+    return {
+        "error": "Frontend file not found",
+        "expected_path": frontend_path,
+        "current_working_dir": os.getcwd()
+    }
 
 @app.get("/api/health")
 async def health_check():
@@ -407,4 +415,5 @@ async def shutdown_event():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=config.API_HOST, port=config.API_PORT)
+    logging.basicConfig(level=logging.INFO)
+    uvicorn.run(app, host=config.API_HOST, port=config.API_PORT,log_level="debug")
