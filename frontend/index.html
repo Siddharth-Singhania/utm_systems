@@ -1,0 +1,879 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UTM System | Unmanned Traffic Management</title>
+    
+    <!-- Cesium -->
+    <script src="https://cesium.com/downloads/cesiumjs/releases/1.108/Build/Cesium/Cesium.js"></script>
+    <link href="https://cesium.com/downloads/cesiumjs/releases/1.108/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+    
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@300;400;600;700&display=swap');
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        :root {
+            --bg-primary: #0a0e1a;
+            --bg-secondary: #131927;
+            --bg-tertiary: #1a2234;
+            --accent-primary: #00d9ff;
+            --accent-secondary: #7c3aed;
+            --accent-success: #10b981;
+            --accent-warning: #f59e0b;
+            --accent-danger: #ef4444;
+            --text-primary: #e8eaed;
+            --text-secondary: #9ca3af;
+            --text-tertiary: #6b7280;
+            --border-color: #2d3748;
+            --glass-bg: rgba(19, 25, 39, 0.85);
+            --glass-border: rgba(0, 217, 255, 0.2);
+        }
+        
+        body {
+            font-family: 'Outfit', -apple-system, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            overflow: hidden;
+            height: 100vh;
+        }
+        
+        /* Main Layout */
+        #cesiumContainer {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+        
+        /* Header */
+        .header {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 70px;
+            background: var(--glass-bg);
+            backdrop-filter: blur(20px);
+            border-bottom: 1px solid var(--glass-border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 30px;
+            z-index: 1000;
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.3);
+        }
+        
+        .header-title {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        
+        .header-logo {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 700;
+            font-size: 18px;
+            color: white;
+        }
+        
+        .header-title h1 {
+            font-size: 22px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+        }
+        
+        .header-title .subtitle {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: var(--text-tertiary);
+            font-weight: 600;
+        }
+        
+        .system-status {
+            display: flex;
+            gap: 20px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+        }
+        
+        .status-item {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+        }
+        
+        .status-label {
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-tertiary);
+        }
+        
+        .status-value {
+            font-weight: 700;
+            color: var(--accent-primary);
+            margin-top: 2px;
+        }
+        
+        /* Control Panel */
+        .control-panel {
+            position: absolute;
+            top: 90px;
+            left: 20px;
+            width: 380px;
+            max-height: calc(100vh - 120px);
+            background: var(--glass-bg);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--glass-border);
+            border-radius: 16px;
+            z-index: 900;
+            overflow-y: auto;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+        }
+        
+        .panel-section {
+            padding: 25px;
+            border-bottom: 1px solid var(--border-color);
+        }
+        
+        .panel-section:last-child {
+            border-bottom: none;
+        }
+        
+        .section-title {
+            font-size: 14px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: var(--accent-primary);
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .section-title::before {
+            content: '';
+            width: 3px;
+            height: 16px;
+            background: linear-gradient(to bottom, var(--accent-primary), var(--accent-secondary));
+            border-radius: 2px;
+        }
+        
+        /* Form Styles */
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        .form-label {
+            display: block;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+        }
+        
+        .input-group {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }
+        
+        input[type="number"] {
+            width: 100%;
+            padding: 12px 14px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            transition: all 0.2s;
+        }
+        
+        input[type="number"]:focus {
+            outline: none;
+            border-color: var(--accent-primary);
+            box-shadow: 0 0 0 3px rgba(0, 217, 255, 0.1);
+        }
+        
+        .btn {
+            width: 100%;
+            padding: 14px 20px;
+            border: none;
+            border-radius: 10px;
+            font-family: 'Outfit', sans-serif;
+            font-size: 14px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            cursor: pointer;
+            transition: all 0.3s;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+            transition: left 0.5s;
+        }
+        
+        .btn:hover::before {
+            left: 100%;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+            color: white;
+            box-shadow: 0 10px 30px rgba(0, 217, 255, 0.3);
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 15px 40px rgba(0, 217, 255, 0.4);
+        }
+        
+        .btn-primary:active {
+            transform: translateY(0);
+        }
+        
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+        }
+        
+        .stat-card {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 16px;
+            transition: all 0.3s;
+        }
+        
+        .stat-card:hover {
+            border-color: var(--accent-primary);
+            transform: translateY(-2px);
+        }
+        
+        .stat-label {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-tertiary);
+            margin-bottom: 8px;
+        }
+        
+        .stat-value {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 28px;
+            font-weight: 700;
+            color: var(--accent-primary);
+            line-height: 1;
+        }
+        
+        /* Active Missions */
+        .mission-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        
+        .mission-card {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-left: 3px solid var(--accent-primary);
+            border-radius: 10px;
+            padding: 14px;
+            font-size: 12px;
+            animation: slideIn 0.3s ease-out;
+        }
+        
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateX(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+        
+        .mission-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .mission-id {
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 700;
+            color: var(--accent-primary);
+        }
+        
+        .status-badge {
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .status-assigned { background: #7c3aed; color: white; }
+        .status-en-route { background: #3b82f6; color: white; }
+        .status-at-delivery { background: #10b981; color: white; }
+        
+        .mission-info {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--text-secondary);
+            font-size: 11px;
+        }
+        
+        /* Legend */
+        .legend {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            background: var(--glass-bg);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--glass-border);
+            border-radius: 12px;
+            padding: 20px;
+            z-index: 900;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+        }
+        
+        .legend-title {
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 12px;
+            color: var(--accent-primary);
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 8px;
+            font-size: 12px;
+        }
+        
+        .legend-color {
+            width: 20px;
+            height: 12px;
+            border-radius: 3px;
+        }
+        
+        /* Scrollbar */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: var(--bg-secondary);
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: var(--accent-primary);
+            border-radius: 3px;
+        }
+        
+        /* Loading */
+        .loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            z-index: 2000;
+        }
+        
+        .spinner {
+            width: 60px;
+            height: 60px;
+            border: 4px solid var(--bg-tertiary);
+            border-top: 4px solid var(--accent-primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <!-- Loading Screen -->
+    <div id="loading" class="loading">
+        <div class="spinner"></div>
+        <div style="font-family: 'JetBrains Mono', monospace; color: var(--accent-primary);">
+            INITIALIZING UTM SYSTEM...
+        </div>
+    </div>
+    
+    <!-- Header -->
+    <div class="header">
+        <div class="header-title">
+            <div class="header-logo">UTM</div>
+            <div>
+                <h1>Unmanned Traffic Management</h1>
+                <div class="subtitle">Autonomous Delivery Coordination</div>
+            </div>
+        </div>
+        <div class="system-status">
+            <div class="status-item">
+                <div class="status-label">Active Drones</div>
+                <div class="status-value" id="activeDroneCount">0</div>
+            </div>
+            <div class="status-item">
+                <div class="status-label">Missions</div>
+                <div class="status-value" id="missionCount">0</div>
+            </div>
+            <div class="status-item">
+                <div class="status-label">Conflicts</div>
+                <div class="status-value" id="conflictCount">0</div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Cesium Container -->
+    <div id="cesiumContainer"></div>
+    
+    <!-- Control Panel -->
+    <div class="control-panel">
+        <!-- Create Delivery -->
+        <div class="panel-section">
+            <div class="section-title">Create Delivery</div>
+            
+            <div class="form-group">
+                <label class="form-label">Pickup Location</label>
+                <div class="input-group">
+                    <input type="number" id="pickupLat" placeholder="Latitude" step="0.0001" value="37.77">
+                    <input type="number" id="pickupLon" placeholder="Longitude" step="0.0001" value="-122.43">
+                </div>
+            </div>
+            
+            <div class="form-group">
+                <label class="form-label">Delivery Location</label>
+                <div class="input-group">
+                    <input type="number" id="deliveryLat" placeholder="Latitude" step="0.0001" value="37.75">
+                    <input type="number" id="deliveryLon" placeholder="Longitude" step="0.0001" value="-122.41">
+                </div>
+            </div>
+            
+            <button class="btn btn-primary" onclick="createDelivery()">
+                Request Delivery
+            </button>
+        </div>
+        
+        <!-- System Stats -->
+        <div class="panel-section">
+            <div class="section-title">System Overview</div>
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Total Flights</div>
+                    <div class="stat-value" id="totalFlights">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Resolved</div>
+                    <div class="stat-value" id="resolvedConflicts">0</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Active Missions -->
+        <div class="panel-section">
+            <div class="section-title">Active Missions</div>
+            <div class="mission-list" id="missionList">
+                <div style="text-align: center; color: var(--text-tertiary); padding: 20px;">
+                    No active missions
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Legend -->
+    <div class="legend">
+        <div class="legend-title">Map Legend</div>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #ef4444;"></div>
+            <span>No-Fly Zones</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #f59e0b;"></div>
+            <span>Sensitive Areas</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #00d9ff;"></div>
+            <span>Flight Paths</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #10b981;"></div>
+            <span>Active Drones</span>
+        </div>
+    </div>
+    
+    <script>
+        // Configuration
+        const API_URL = 'http://localhost:8000';
+        const WS_URL = 'ws://localhost:8000/ws';
+        
+        // Cesium Configuration
+        Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI5N2UyMjcwOS00MDY1LTQxYjEtYjZjMy00YTU0ZTg1YmFjYWEiLCJpZCI6ODE5MjQsImlhdCI6MTY0MzI0ODMxMn0.ipgVLm1pJa4MqBuTN74UhPRlGXn5EsXuqmEpBJW-OUs';
+        
+        // Initialize Cesium Viewer
+        const viewer = new Cesium.Viewer('cesiumContainer', {
+            terrainProvider: Cesium.createWorldTerrain(),
+            baseLayerPicker: false,
+            geocoder: false,
+            homeButton: false,
+            sceneModePicker: false,
+            navigationHelpButton: false,
+            animation: false,
+            timeline: false,
+            fullscreenButton: false,
+            vrButton: false,
+            infoBox: false,
+            selectionIndicator: false
+        });
+        
+        // Camera view over San Francisco
+        viewer.camera.setView({
+            destination: Cesium.Cartesian3.fromDegrees(-122.4, 37.7, 10000),
+            orientation: {
+                heading: Cesium.Math.toRadians(0),
+                pitch: Cesium.Math.toRadians(-45),
+                roll: 0.0
+            }
+        });
+        
+        // Data structures
+        const drones = new Map();
+        const trajectories = new Map();
+        const geofenceEntities = [];
+        let ws = null;
+        
+        // WebSocket Connection
+        function connectWebSocket() {
+            ws = new WebSocket(WS_URL);
+            
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                document.getElementById('loading').style.display = 'none';
+            };
+            
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                handleWebSocketMessage(data);
+            };
+            
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+            };
+            
+            ws.onclose = () => {
+                console.log('WebSocket disconnected, reconnecting...');
+                setTimeout(connectWebSocket, 3000);
+            };
+        }
+        
+        // Handle WebSocket Messages
+        function handleWebSocketMessage(data) {
+            switch(data.type) {
+                case 'initial_state':
+                    loadGeofencing(data.geofencing);
+                    data.drones.forEach(updateDrone);
+                    data.missions.forEach(updateMission);
+                    break;
+                    
+                case 'telemetry':
+                    updateDrone(data.data);
+                    break;
+                    
+                case 'mission_created':
+                    updateMission(data.mission);
+                    visualizeTrajectory(data.mission);
+                    break;
+                    
+                case 'drone_registered':
+                    updateDrone(data.drone);
+                    break;
+                    
+                case 'conflict_resolved':
+                    console.log('Conflict resolved:', data.resolution_method);
+                    updateConflictCount();
+                    break;
+            }
+        }
+        
+        // Update Drone Visualization
+        function updateDrone(telemetry) {
+            const { drone_id, position, status, battery_level } = telemetry;
+            
+            if (!drones.has(drone_id)) {
+                // Create new drone entity
+                const entity = viewer.entities.add({
+                    id: drone_id,
+                    position: Cesium.Cartesian3.fromDegrees(
+                        position.longitude,
+                        position.latitude,
+                        position.altitude
+                    ),
+                    billboard: {
+                        image: createDroneIcon(status),
+                        scale: 0.5,
+                        verticalOrigin: Cesium.VerticalOrigin.BOTTOM
+                    },
+                    label: {
+                        text: drone_id,
+                        font: '12px JetBrains Mono',
+                        fillColor: Cesium.Color.CYAN,
+                        outlineColor: Cesium.Color.BLACK,
+                        outlineWidth: 2,
+                        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                        verticalOrigin: Cesium.VerticalOrigin.TOP,
+                        pixelOffset: new Cesium.Cartesian2(0, 10)
+                    }
+                });
+                
+                drones.set(drone_id, entity);
+            } else {
+                // Update existing drone
+                const entity = drones.get(drone_id);
+                entity.position = Cesium.Cartesian3.fromDegrees(
+                    position.longitude,
+                    position.latitude,
+                    position.altitude
+                );
+                entity.billboard.image = createDroneIcon(status);
+            }
+            
+            updateStats();
+        }
+        
+        // Create Drone Icon
+        function createDroneIcon(status) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 64;
+            canvas.height = 64;
+            const ctx = canvas.getContext('2d');
+            
+            // Status color
+            let color = '#10b981'; // green
+            if (status === 'assigned' || status === 'en_route_pickup') color = '#3b82f6';
+            if (status === 'en_route_delivery') color = '#00d9ff';
+            if (status === 'emergency') color = '#ef4444';
+            
+            // Draw drone shape
+            ctx.fillStyle = color;
+            ctx.beginPath();
+            ctx.arc(32, 32, 20, 0, Math.PI * 2);
+            ctx.fill();
+            
+            // Outline
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+            
+            return canvas.toDataURL();
+        }
+        
+        // Visualize Trajectory
+        function visualizeTrajectory(mission) {
+            if (!mission.trajectory || !mission.drone_id) return;
+            
+            const positions = mission.trajectory.waypoints.map(wp => 
+                Cesium.Cartesian3.fromDegrees(
+                    wp.position.longitude,
+                    wp.position.latitude,
+                    wp.position.altitude
+                )
+            );
+            
+            const entity = viewer.entities.add({
+                id: `trajectory_${mission.mission_id}`,
+                polyline: {
+                    positions: positions,
+                    width: 3,
+                    material: new Cesium.PolylineGlowMaterialProperty({
+                        glowPower: 0.2,
+                        color: Cesium.Color.CYAN
+                    })
+                }
+            });
+            
+            trajectories.set(mission.mission_id, entity);
+        }
+        
+        // Load Geofencing
+        function loadGeofencing(geofencing) {
+            // No-Fly Zones (Red)
+            geofencing.no_fly_zones.forEach(zone => {
+                const positions = zone.polygon.map(([lat, lon]) => 
+                    Cesium.Cartesian3.fromDegrees(lon, lat)
+                );
+                
+                viewer.entities.add({
+                    polygon: {
+                        hierarchy: new Cesium.PolygonHierarchy(positions),
+                        material: Cesium.Color.RED.withAlpha(0.3),
+                        outline: true,
+                        outlineColor: Cesium.Color.RED,
+                        outlineWidth: 2,
+                        height: 0,
+                        extrudedHeight: 150
+                    },
+                    label: {
+                        text: zone.name,
+                        font: '14px Outfit',
+                        fillColor: Cesium.Color.RED,
+                        outlineColor: Cesium.Color.BLACK,
+                        outlineWidth: 2,
+                        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                        verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+                        pixelOffset: new Cesium.Cartesian2(0, -10)
+                    }
+                });
+            });
+            
+            // Sensitive Areas (Orange)
+            geofencing.sensitive_areas.forEach(area => {
+                const positions = area.polygon.map(([lat, lon]) => 
+                    Cesium.Cartesian3.fromDegrees(lon, lat)
+                );
+                
+                viewer.entities.add({
+                    polygon: {
+                        hierarchy: new Cesium.PolygonHierarchy(positions),
+                        material: Cesium.Color.ORANGE.withAlpha(0.2),
+                        outline: true,
+                        outlineColor: Cesium.Color.ORANGE,
+                        outlineWidth: 2,
+                        height: 0,
+                        extrudedHeight: 100
+                    }
+                });
+            });
+        }
+        
+        // Update Mission List
+        function updateMission(mission) {
+            const missionList = document.getElementById('missionList');
+            
+            if (missionList.querySelector('[style*="No active missions"]')) {
+                missionList.innerHTML = '';
+            }
+            
+            const statusClass = `status-${mission.status.replace('_', '-')}`;
+            const statusText = mission.status.replace(/_/g, ' ').toUpperCase();
+            
+            const missionCard = document.createElement('div');
+            missionCard.className = 'mission-card';
+            missionCard.innerHTML = `
+                <div class="mission-header">
+                    <span class="mission-id">${mission.mission_id}</span>
+                    <span class="status-badge ${statusClass}">${statusText}</span>
+                </div>
+                <div class="mission-info">
+                    Drone: ${mission.drone_id || 'Unassigned'}<br>
+                    Distance: ${mission.trajectory ? (mission.trajectory.total_distance / 1000).toFixed(2) : 'N/A'} km<br>
+                    ETA: ${mission.trajectory ? Math.floor(mission.trajectory.total_time / 60) : 'N/A'} min
+                </div>
+            `;
+            
+            missionList.appendChild(missionCard);
+        }
+        
+        // Update Statistics
+        function updateStats() {
+            document.getElementById('activeDroneCount').textContent = drones.size;
+        }
+        
+        function updateConflictCount() {
+            fetch(`${API_URL}/api/system/status`)
+                .then(res => res.json())
+                .then(data => {
+                    document.getElementById('missionCount').textContent = data.active_missions;
+                    document.getElementById('conflictCount').textContent = data.conflicts_detected;
+                    document.getElementById('totalFlights').textContent = data.total_flights_today;
+                    document.getElementById('resolvedConflicts').textContent = data.conflicts_resolved;
+                });
+        }
+        
+        // Create Delivery Request
+        async function createDelivery() {
+            const pickupLat = parseFloat(document.getElementById('pickupLat').value);
+            const pickupLon = parseFloat(document.getElementById('pickupLon').value);
+            const deliveryLat = parseFloat(document.getElementById('deliveryLat').value);
+            const deliveryLon = parseFloat(document.getElementById('deliveryLon').value);
+            
+            const request = {
+                pickup: {
+                    latitude: pickupLat,
+                    longitude: pickupLon,
+                    altitude: 0
+                },
+                delivery: {
+                    latitude: deliveryLat,
+                    longitude: deliveryLon,
+                    altitude: 0
+                }
+            };
+            
+            try {
+                const response = await fetch(`${API_URL}/api/delivery/request`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(request)
+                });
+                
+                if (response.ok) {
+                    const result = await response.json();
+                    alert(`✓ Mission created: ${result.mission_id}`);
+                } else {
+                    const error = await response.text();
+                    alert(`✗ Error: ${error}`);
+                }
+            } catch (error) {
+                alert(`✗ Network error: ${error.message}`);
+            }
+        }
+        
+        // Initialize
+        connectWebSocket();
+        setInterval(updateConflictCount, 5000);
+    </script>
+</body>
+</html>

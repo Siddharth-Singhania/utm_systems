@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UTM System Architecture</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@400;600;700&display=swap');
+        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: 'Outfit', sans-serif;
+            background: linear-gradient(135deg, #0a0e1a 0%, #1a2234 100%);
+            color: #e8eaed;
+            padding: 40px 20px;
+            min-height: 100vh;
+        }
+        
+        .container { max-width: 1400px; margin: 0 auto; }
+        
+        h1 {
+            text-align: center;
+            font-size: 48px;
+            font-weight: 700;
+            margin-bottom: 20px;
+            background: linear-gradient(135deg, #00d9ff, #7c3aed);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .subtitle {
+            text-align: center;
+            font-size: 18px;
+            color: #9ca3af;
+            margin-bottom: 60px;
+        }
+        
+        .architecture {
+            display: flex;
+            flex-direction: column;
+            gap: 40px;
+        }
+        
+        .layer {
+            background: rgba(19, 25, 39, 0.85);
+            border: 2px solid rgba(0, 217, 255, 0.3);
+            border-radius: 20px;
+            padding: 30px;
+            position: relative;
+            transition: all 0.3s;
+        }
+        
+        .layer:hover {
+            border-color: rgba(0, 217, 255, 0.6);
+            transform: translateY(-5px);
+            box-shadow: 0 20px 60px rgba(0, 217, 255, 0.2);
+        }
+        
+        .layer-title {
+            font-size: 24px;
+            font-weight: 700;
+            margin-bottom: 20px;
+            color: #00d9ff;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        
+        .layer-icon {
+            width: 50px;
+            height: 50px;
+            background: linear-gradient(135deg, #00d9ff, #7c3aed);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+        }
+        
+        .components {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+        
+        .component {
+            background: rgba(26, 34, 52, 0.8);
+            border: 1px solid rgba(0, 217, 255, 0.2);
+            border-radius: 12px;
+            padding: 20px;
+            transition: all 0.3s;
+        }
+        
+        .component:hover {
+            border-color: #00d9ff;
+            transform: scale(1.05);
+        }
+        
+        .component-name {
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 700;
+            font-size: 16px;
+            color: #00d9ff;
+            margin-bottom: 10px;
+        }
+        
+        .component-desc {
+            font-size: 14px;
+            color: #9ca3af;
+            line-height: 1.6;
+        }
+        
+        .arrow {
+            text-align: center;
+            font-size: 32px;
+            color: #00d9ff;
+            margin: -20px 0;
+        }
+        
+        .features {
+            margin-top: 60px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 30px;
+        }
+        
+        .feature-card {
+            background: rgba(19, 25, 39, 0.85);
+            border-left: 4px solid #00d9ff;
+            border-radius: 12px;
+            padding: 25px;
+        }
+        
+        .feature-title {
+            font-size: 20px;
+            font-weight: 700;
+            margin-bottom: 15px;
+            color: #00d9ff;
+        }
+        
+        .feature-list {
+            list-style: none;
+            padding: 0;
+        }
+        
+        .feature-list li {
+            padding: 8px 0;
+            padding-left: 25px;
+            position: relative;
+            font-size: 14px;
+            color: #9ca3af;
+        }
+        
+        .feature-list li::before {
+            content: '✓';
+            position: absolute;
+            left: 0;
+            color: #10b981;
+            font-weight: 700;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>UTM System Architecture</h1>
+        <p class="subtitle">4D Trajectory Management with Virtual Simulation</p>
+        
+        <div class="architecture">
+            <!-- Frontend Layer -->
+            <div class="layer">
+                <div class="layer-title">
+                    <div class="layer-icon">🌐</div>
+                    Frontend Layer - CesiumJS Visualization
+                </div>
+                <p style="color: #9ca3af; margin-bottom: 20px;">
+                    Mission-critical 3D interface for real-time drone monitoring and control
+                </p>
+                <div class="components">
+                    <div class="component">
+                        <div class="component-name">3D Map Renderer</div>
+                        <div class="component-desc">
+                            CesiumJS-powered globe with terrain, showing drone positions in real-time
+                        </div>
+                    </div>
+                    <div class="component">
+                        <div class="component-name">Control Panel</div>
+                        <div class="component-desc">
+                            Create deliveries, monitor missions, view system statistics
+                        </div>
+                    </div>
+                    <div class="component">
+                        <div class="component-name">WebSocket Client</div>
+                        <div class="component-desc">
+                            Real-time bidirectional communication with backend
+                        </div>
+                    </div>
+                    <div class="component">
+                        <div class="component-name">Geofence Visualizer</div>
+                        <div class="component-desc">
+                            Display no-fly zones (red) and sensitive areas (orange)
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="arrow">↓</div>
+            
+            <!-- Backend Layer -->
+            <div class="layer">
+                <div class="layer-title">
+                    <div class="layer-icon">⚙️</div>
+                    Backend Layer - FastAPI UTM Core
+                </div>
+                <p style="color: #9ca3af; margin-bottom: 20px;">
+                    High-performance REST API and WebSocket server handling all UTM logic
+                </p>
+                <div class="components">
+                    <div class="component">
+                        <div class="component-name">pathfinding.py</div>
+                        <div class="component-desc">
+                            A* algorithm for 4D trajectory planning (lat, lon, alt, time)
+                        </div>
+                    </div>
+                    <div class="component">
+                        <div class="component-name">geofencing.py</div>
+                        <div class="component-desc">
+                            Point-in-polygon tests, cost multipliers, spatial queries
+                        </div>
+                    </div>
+                    <div class="component">
+                        <div class="component-name">conflict_detection.py</div>
+                        <div class="component-desc">
+                            4D collision detection and resolution (speed/altitude adjustment)
+                        </div>
+                    </div>
+                    <div class="component">
+                        <div class="component-name">main.py</div>
+                        <div class="component-desc">
+                            FastAPI app with REST endpoints and WebSocket handler
+                        </div>
+                    </div>
+                    <div class="component">
+                        <div class="component-name">models.py</div>
+                        <div class="component-desc">
+                            Pydantic models for type safety and validation
+                        </div>
+                    </div>
+                    <div class="component">
+                        <div class="component-name">config.py</div>
+                        <div class="component-desc">
+                            System parameters, operational bounds, geofence definitions
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="arrow">↓</div>
+            
+            <!-- Simulation Layer -->
+            <div class="layer">
+                <div class="layer-title">
+                    <div class="layer-icon">🚁</div>
+                    Simulation Layer - Virtual Drone Fleet
+                </div>
+                <p style="color: #9ca3af; margin-bottom: 20px;">
+                    Physics-based simulation of 10 virtual drones with battery models
+                </p>
+                <div class="components">
+                    <div class="component">
+                        <div class="component-name">VirtualDrone Class</div>
+                        <div class="component-desc">
+                            Each drone has position, velocity, battery, and follows assigned trajectories
+                        </div>
+                    </div>
+                    <div class="component">
+                        <div class="component-name">Physics Engine</div>
+                        <div class="component-desc">
+                            Updates drone position based on target waypoints and speed
+                        </div>
+                    </div>
+                    <div class="component">
+                        <div class="component-name">Battery Model</div>
+                        <div class="component-desc">
+                            Simulates power consumption (higher when climbing)
+                        </div>
+                    </div>
+                    <div class="component">
+                        <div class="component-name">Telemetry Sender</div>
+                        <div class="component-desc">
+                            HTTP client sending position updates at 2 Hz
+                        </div>
+                    </div>
+                    <div class="component">
+                        <div class="component-name">Mission Listener</div>
+                        <div class="component-desc">
+                            WebSocket client receiving trajectory assignments
+                        </div>
+                    </div>
+                    <div class="component">
+                        <div class="component-name">Auto Mission Generator</div>
+                        <div class="component-desc">
+                            Creates random delivery requests for testing
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Key Features -->
+        <div class="features">
+            <div class="feature-card">
+                <div class="feature-title">4D Trajectory Planning</div>
+                <ul class="feature-list">
+                    <li>A* algorithm with 4D nodes (lat, lon, alt, time)</li>
+                    <li>Geofencing cost integration</li>
+                    <li>Altitude stratification (highway lanes)</li>
+                    <li>Energy-optimized paths</li>
+                </ul>
+            </div>
+            
+            <div class="feature-card">
+                <div class="feature-title">Conflict Management</div>
+                <ul class="feature-list">
+                    <li>Static: No-fly zones (infinite cost)</li>
+                    <li>Static: Sensitive areas (elevated cost)</li>
+                    <li>Dynamic: Speed-based resolution</li>
+                    <li>Dynamic: Altitude separation</li>
+                </ul>
+            </div>
+            
+            <div class="feature-card">
+                <div class="feature-title">Real-Time Simulation</div>
+                <ul class="feature-list">
+                    <li>10 virtual drones with physics</li>
+                    <li>2 Hz telemetry updates</li>
+                    <li>WebSocket live streaming</li>
+                    <li>Automatic mission generation</li>
+                </ul>
+            </div>
+            
+            <div class="feature-card">
+                <div class="feature-title">3D Visualization</div>
+                <ul class="feature-list">
+                    <li>CesiumJS globe renderer</li>
+                    <li>Real-time drone tracking</li>
+                    <li>Flight path display</li>
+                    <li>Geofence zone rendering</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
