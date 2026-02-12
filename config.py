@@ -17,7 +17,7 @@ DRONE_BATTERY_CAPACITY = 3600.0  # Watt-hours
 DRONE_POWER_CONSUMPTION = 200.0  # Watts at cruise
 
 # Grid resolution for pathfinding
-GRID_RESOLUTION = 300  # meters (horizontal grid spacing) 
+GRID_RESOLUTION = 50  # meters (horizontal grid spacing)
 ALTITUDE_LAYERS = [30, 50, 70, 90, 110]  # Discrete altitude levels in meters
 
 # Conflict detection parameters
@@ -110,13 +110,13 @@ SENSITIVE_AREAS = [
 # ============================================================================
 # OPERATIONAL BOUNDS
 # ============================================================================
-# Geographic boundary for the UTM system
+# Geographic boundary for the UTM system (Expanded San Francisco Bay Area)
 
 OPERATIONAL_AREA = {
-    'min_lat': 37.60,
-    'max_lat': 37.80,
-    'min_lon': -122.45,
-    'max_lon': -122.35
+    'min_lat': 37.50,
+    'max_lat': 37.90,
+    'min_lon': -122.55,
+    'max_lon': -122.25
 }
 
 # ============================================================================

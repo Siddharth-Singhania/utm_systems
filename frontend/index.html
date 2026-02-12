@@ -135,7 +135,7 @@
             position: absolute;
             top: 90px;
             left: 20px;
-            width: 380px;
+            width: 420px;
             max-height: calc(100vh - 120px);
             background: var(--glass-bg);
             backdrop-filter: blur(20px);
@@ -173,6 +173,46 @@
             height: 16px;
             background: linear-gradient(to bottom, var(--accent-primary), var(--accent-secondary));
             border-radius: 2px;
+        }
+        
+        /* Demo Scenarios */
+        .demo-scenarios {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        
+        .demo-btn {
+            padding: 12px 16px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-family: 'Outfit', sans-serif;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-align: left;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .demo-btn:hover {
+            border-color: var(--accent-primary);
+            background: rgba(0, 217, 255, 0.1);
+            transform: translateX(5px);
+        }
+        
+        .demo-btn-label {
+            font-weight: 600;
+        }
+        
+        .demo-btn-distance {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            color: var(--text-tertiary);
         }
         
         /* Form Styles */
@@ -349,7 +389,8 @@
         }
         
         .status-assigned { background: #7c3aed; color: white; }
-        .status-en-route { background: #3b82f6; color: white; }
+        .status-en-route-pickup { background: #3b82f6; color: white; }
+        .status-en-route-delivery { background: #00d9ff; color: white; }
         .status-at-delivery { background: #10b981; color: white; }
         
         .mission-info {
@@ -473,9 +514,39 @@
     
     <!-- Control Panel -->
     <div class="control-panel">
+        <!-- Demo Scenarios -->
+        <div class="panel-section">
+            <div class="section-title">🎯 Demo Scenarios</div>
+            <div class="demo-scenarios">
+                <button class="demo-btn" onclick="loadDemoScenario(1)">
+                    <span class="demo-btn-label">Downtown → Airport</span>
+                    <span class="demo-btn-distance">~15 km</span>
+                </button>
+                <button class="demo-btn" onclick="loadDemoScenario(2)">
+                    <span class="demo-btn-label">Marina → Financial District</span>
+                    <span class="demo-btn-distance">~8 km</span>
+                </button>
+                <button class="demo-btn" onclick="loadDemoScenario(3)">
+                    <span class="demo-btn-label">Mission District → North Beach</span>
+                    <span class="demo-btn-distance">~6 km</span>
+                </button>
+                <button class="demo-btn" onclick="loadDemoScenario(4)">
+                    <span class="demo-btn-label">Golden Gate Park → Embarcadero</span>
+                    <span class="demo-btn-distance">~10 km</span>
+                </button>
+                <button class="demo-btn" onclick="loadDemoScenario(5)">
+                    <span class="demo-btn-label">Castro → Fisherman's Wharf</span>
+                    <span class="demo-btn-distance">~7 km</span>
+                </button>
+            </div>
+            <button class="btn btn-primary" onclick="loadAllDemoScenarios()" style="margin-top: 10px;">
+                Launch All Scenarios
+            </button>
+        </div>
+        
         <!-- Create Delivery -->
         <div class="panel-section">
-            <div class="section-title">Create Delivery</div>
+            <div class="section-title">📦 Custom Delivery</div>
             
             <div class="form-group">
                 <label class="form-label">Pickup Location</label>
@@ -500,7 +571,7 @@
         
         <!-- System Stats -->
         <div class="panel-section">
-            <div class="section-title">System Overview</div>
+            <div class="section-title">📊 System Overview</div>
             <div class="stats-grid">
                 <div class="stat-card">
                     <div class="stat-label">Total Flights</div>
@@ -515,7 +586,7 @@
         
         <!-- Active Missions -->
         <div class="panel-section">
-            <div class="section-title">Active Missions</div>
+            <div class="section-title">✈️ Active Missions</div>
             <div class="mission-list" id="missionList">
                 <div style="text-align: center; color: var(--text-tertiary); padding: 20px;">
                     No active missions
@@ -547,15 +618,40 @@
     
     <script>
         // Configuration
-        const API_URL = 'http://localhost:8000';
-        const WS_URL = 'ws://localhost:8000/ws';
+        const API_URL = 'http://127.0.0.1:8000';
+        const WS_URL = 'ws://127.0.0.1:8000/ws';
+        const MIN_ALTITUDE = 20.0; // Minimum safe altitude from config
+        
+        // Demo Scenarios (pre-configured deliveries)
+        const DEMO_SCENARIOS = {
+            1: { // Downtown → Airport
+                pickup: { lat: 37.7749, lon: -122.4194 },
+                delivery: { lat: 37.6213, lon: -122.3790 }
+            },
+            2: { // Marina → Financial District
+                pickup: { lat: 37.8055, lon: -122.4367 },
+                delivery: { lat: 37.7946, lon: -122.3999 }
+            },
+            3: { // Mission District → North Beach
+                pickup: { lat: 37.7599, lon: -122.4148 },
+                delivery: { lat: 37.8009, lon: -122.4103 }
+            },
+            4: { // Golden Gate Park → Embarcadero
+                pickup: { lat: 37.7694, lon: -122.4862 },
+                delivery: { lat: 37.7955, lon: -122.3937 }
+            },
+            5: { // Castro → Fisherman's Wharf
+                pickup: { lat: 37.7609, lon: -122.4350 },
+                delivery: { lat: 37.8080, lon: -122.4177 }
+            }
+        };
         
         // Cesium Configuration
-        Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI1ZWQ4NmZjZS1hMGVkLTQzNjYtYTIwZi1kYWFmMDM2NmYzZTIiLCJpZCI6MzkwMDE1LCJpYXQiOjE3NzA5MDQ5MTJ9.oMikqljPMbCSIgEWEdCwZZnJyFDDLDU4RUYYpUrXxMI';
+        Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI5N2UyMjcwOS00MDY1LTQxYjEtYjZjMy00YTU0ZTg1YmFjYWEiLCJpZCI6ODE5MjQsImlhdCI6MTY0MzI0ODMxMn0.ipgVLm1pJa4MqBuTN74UhPRlGXn5EsXuqmEpBJW-OUs';
         
         // Initialize Cesium Viewer
         const viewer = new Cesium.Viewer('cesiumContainer', {
-            terrain: Cesium.Terrain.fromWorldTerrain(),
+            terrainProvider: Cesium.createWorldTerrain(),
             baseLayerPicker: false,
             geocoder: false,
             homeButton: false,
@@ -569,9 +665,9 @@
             selectionIndicator: false
         });
         
-        // Camera view over San Francisco
+        // Camera view over Expanded San Francisco Bay Area
         viewer.camera.setView({
-            destination: Cesium.Cartesian3.fromDegrees(-122.4, 37.7, 10000),
+            destination: Cesium.Cartesian3.fromDegrees(-122.4, 37.7, 20000),
             orientation: {
                 heading: Cesium.Math.toRadians(0),
                 pitch: Cesium.Math.toRadians(-45),
@@ -638,7 +734,7 @@
             }
         }
         
-        // Update Drone Visualization
+        // Update Drone Visualization with REAL-TIME POSITION UPDATES
         function updateDrone(telemetry) {
             const { drone_id, position, status, battery_level } = telemetry;
             
@@ -670,7 +766,7 @@
                 
                 drones.set(drone_id, entity);
             } else {
-                // Update existing drone
+                // *** KEY FIX: Update existing drone position in REAL-TIME ***
                 const entity = drones.get(drone_id);
                 entity.position = Cesium.Cartesian3.fromDegrees(
                     position.longitude,
@@ -678,6 +774,7 @@
                     position.altitude
                 );
                 entity.billboard.image = createDroneIcon(status);
+                entity.label.text = `${drone_id} (${Math.round(battery_level)}%)`;
             }
             
             updateStats();
@@ -710,7 +807,7 @@
             return canvas.toDataURL();
         }
         
-        // Visualize Trajectory
+        // *** KEY FIX: Better Trajectory Visualization ***
         function visualizeTrajectory(mission) {
             if (!mission.trajectory || !mission.drone_id) return;
             
@@ -722,19 +819,28 @@
                 )
             );
             
+            // Remove old trajectory if exists
+            if (trajectories.has(mission.mission_id)) {
+                viewer.entities.remove(trajectories.get(mission.mission_id));
+            }
+            
+            // Create new trajectory with better visibility
             const entity = viewer.entities.add({
                 id: `trajectory_${mission.mission_id}`,
                 polyline: {
                     positions: positions,
-                    width: 3,
+                    width: 4,
                     material: new Cesium.PolylineGlowMaterialProperty({
-                        glowPower: 0.2,
+                        glowPower: 0.3,
                         color: Cesium.Color.CYAN
-                    })
+                    }),
+                    clampToGround: false
                 }
             });
             
             trajectories.set(mission.mission_id, entity);
+            
+            console.log(`✓ Trajectory visualized for ${mission.mission_id}: ${positions.length} waypoints`);
         }
         
         // Load Geofencing
@@ -796,7 +902,7 @@
                 missionList.innerHTML = '';
             }
             
-            const statusClass = `status-${mission.status.replace('_', '-')}`;
+            const statusClass = `status-${mission.status.replace(/_/g, '-')}`;
             const statusText = mission.status.replace(/_/g, ' ').toUpperCase();
             
             const missionCard = document.createElement('div');
@@ -832,6 +938,56 @@
                 });
         }
         
+        // Load Demo Scenario
+        function loadDemoScenario(scenarioNumber) {
+            const scenario = DEMO_SCENARIOS[scenarioNumber];
+            document.getElementById('pickupLat').value = scenario.pickup.lat;
+            document.getElementById('pickupLon').value = scenario.pickup.lon;
+            document.getElementById('deliveryLat').value = scenario.delivery.lat;
+            document.getElementById('deliveryLon').value = scenario.delivery.lon;
+            
+            // Auto-submit
+            createDelivery();
+        }
+        
+        // Load All Demo Scenarios
+        async function loadAllDemoScenarios() {
+            for (let i = 1; i <= 5; i++) {
+                const scenario = DEMO_SCENARIOS[i];
+                
+                const request = {
+                    pickup: {
+                        latitude: scenario.pickup.lat,
+                        longitude: scenario.pickup.lon,
+                        altitude: MIN_ALTITUDE
+                    },
+                    delivery: {
+                        latitude: scenario.delivery.lat,
+                        longitude: scenario.delivery.lon,
+                        altitude: MIN_ALTITUDE
+                    }
+                };
+                
+                try {
+                    const response = await fetch(`${API_URL}/api/delivery/request`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(request)
+                    });
+                    
+                    if (response.ok) {
+                        const result = await response.json();
+                        console.log(`✓ Scenario ${i} launched: ${result.mission_id}`);
+                    }
+                } catch (error) {
+                    console.error(`✗ Scenario ${i} failed:`, error);
+                }
+                
+                // Delay between launches to avoid overwhelming the system
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
+        }
+        
         // Create Delivery Request
         async function createDelivery() {
             const pickupLat = parseFloat(document.getElementById('pickupLat').value);
@@ -843,12 +999,12 @@
                 pickup: {
                     latitude: pickupLat,
                     longitude: pickupLon,
-                    altitude: 0
+                    altitude: MIN_ALTITUDE  // Use minimum safe altitude
                 },
                 delivery: {
                     latitude: deliveryLat,
                     longitude: deliveryLon,
-                    altitude: 0
+                    altitude: MIN_ALTITUDE  // Use minimum safe altitude
                 }
             };
             
@@ -861,7 +1017,7 @@
                 
                 if (response.ok) {
                     const result = await response.json();
-                    alert(`✓ Mission created: ${result.mission_id}`);
+                    console.log(`✓ Mission created: ${result.mission_id}`);
                 } else {
                     const error = await response.text();
                     alert(`✗ Error: ${error}`);

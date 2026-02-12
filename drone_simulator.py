@@ -267,11 +267,11 @@ class FleetSimulator:
                 
                 pickup_lat = random.uniform(bounds['min_lat'], bounds['max_lat'])
                 pickup_lon = random.uniform(bounds['min_lon'], bounds['max_lon'])
-                pickup_alt = 0  # Ground level
+                pickup_alt = config.DRONE_MIN_ALTITUDE  # Use minimum safe altitude
                 
                 delivery_lat = random.uniform(bounds['min_lat'], bounds['max_lat'])
                 delivery_lon = random.uniform(bounds['min_lon'], bounds['max_lon'])
-                delivery_alt = 0  # Ground level
+                delivery_alt = config.DRONE_MIN_ALTITUDE  # Use minimum safe altitude
                 
                 request_data = {
                     "pickup": {
@@ -309,11 +309,10 @@ class FleetSimulator:
         """Run the complete simulation"""
         await self.initialize_fleet()
         
-        # Run concurrent tasks
+        # Run concurrent tasks (auto-mission generator removed per user request)
         await asyncio.gather(
             self.simulation_loop(),
-            self.mission_listener(),
-            self.auto_mission_generator()
+            self.mission_listener()
         )
     
     def stop(self):
