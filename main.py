@@ -107,7 +107,7 @@ async def root():
         with open('frontend/index.html', 'r') as f:
             return HTMLResponse(content=f.read())
     except FileNotFoundError:
-        return {"message": "UTM System API is running... Frontend not found."}
+        return {"message": "UTM System API is running. Frontend not found."}
 
 @app.get("/api/health")
 async def health_check():
@@ -140,139 +140,151 @@ async def get_geofencing_zones():
 
 @app.post("/api/delivery/request")
 async def create_delivery_request(request: DeliveryRequest):
-    """
-    Create a new delivery request
-    This triggers mission assignment and trajectory planning
-    """
-    # Validate locations are within operational area
-    if not geofencing.is_within_operational_area(request.pickup):
-        raise HTTPException(400, "Pickup location outside operational area")
-    
-    if not geofencing.is_within_operational_area(request.delivery):
-        raise HTTPException(400, "Delivery location outside operational area")
-    
-    # Check if locations are in no-fly zones
-    if geofencing.is_in_no_fly_zone(request.pickup):
-        raise HTTPException(400, "Pickup location is in a no-fly zone")
-    
-    if geofencing.is_in_no_fly_zone(request.delivery):
-        raise HTTPException(400, "Delivery location is in a no-fly zone")
-    
-    # Create mission
-    mission_id = f"mission_{uuid.uuid4().hex[:8]}"
-    mission = Mission(
-        mission_id=mission_id,
-        pickup_location=request.pickup,
-        delivery_location=request.delivery,
-        created_at=time.time(),
-        status=DroneStatus.IDLE
-    )
-    
-    # Find available drone (in real system, this would be more sophisticated)
-    available_drone = None
-    for drone_id, telemetry in active_drones.items():
-        if telemetry.status == DroneStatus.IDLE:
-            available_drone = drone_id
-            break
-    
-    if not available_drone:
-        # Queue mission for later
+    try:
+        """
+        Create a new delivery request
+        This triggers mission assignment and trajectory planning
+        """
+        # Validate locations are within operational area
+        if not geofencing.is_within_operational_area(request.pickup):
+            raise HTTPException(400, "Pickup location outside operational area")
+        
+        if not geofencing.is_within_operational_area(request.delivery):
+            raise HTTPException(400, "Delivery location outside operational area")
+        
+        # Check if locations are in no-fly zones
+        if geofencing.is_in_no_fly_zone(request.pickup):
+            raise HTTPException(400, "Pickup location is in a no-fly zone")
+        
+        if geofencing.is_in_no_fly_zone(request.delivery):
+            raise HTTPException(400, "Delivery location is in a no-fly zone")
+        
+        # Create mission
+        mission_id = f"mission_{uuid.uuid4().hex[:8]}"
+        mission = Mission(
+            mission_id=mission_id,
+            pickup_location=request.pickup,
+            delivery_location=request.delivery,
+            created_at=time.time(),
+            status=DroneStatus.IDLE
+        )
+        
+        # Find available drone (in real system, this would be more sophisticated)
+        available_drone = None
+        for drone_id, telemetry in active_drones.items():
+            if telemetry.status == DroneStatus.IDLE:
+                available_drone = drone_id
+                break
+        
+        if not available_drone:
+            # Queue mission for later
+            active_missions[mission_id] = mission
+            system_stats['total_missions'] += 1
+            return {
+                "mission_id": mission_id,
+                "status": "queued",
+                "message": "No drones available. Mission queued."
+            }
+        
+        # Assign drone and plan trajectory
+        mission.drone_id = available_drone
+        mission.assigned_at = time.time()
+        mission.status = DroneStatus.ASSIGNED
+        
+        # Plan trajectory
+        current_position = active_drones[available_drone].position
+        start_time = time.time()
+        
+        # Plan to pickup
+        trajectory_to_pickup = await asyncio.to_thread(
+            pathfinding.plan_trajectory,
+            current_position,
+            request.pickup,
+            start_time
+        )
+
+        
+        if not trajectory_to_pickup:
+            raise HTTPException(500, "Could not plan path to pickup location")
+        
+        # Plan from pickup to delivery
+        pickup_arrival_time = trajectory_to_pickup.waypoints[-1].eta
+        trajectory_to_delivery = await asyncio.to_thread(
+            pathfinding.plan_trajectory,
+            request.pickup,
+            request.delivery,
+            pickup_arrival_time + 30
+        )
+
+        
+        if not trajectory_to_delivery:
+            raise HTTPException(500, "Could not plan path to delivery location")
+        
+        # Combine trajectories
+        combined_waypoints = (trajectory_to_pickup.waypoints + 
+                            trajectory_to_delivery.waypoints)
+        
+        total_distance = (trajectory_to_pickup.total_distance + 
+                        trajectory_to_delivery.total_distance)
+        
+        total_time = (trajectory_to_delivery.waypoints[-1].eta - 
+                    trajectory_to_pickup.waypoints[0].eta)
+        
+        battery_usage = (trajectory_to_pickup.estimated_battery_usage + 
+                        trajectory_to_delivery.estimated_battery_usage)
+        
+        mission.trajectory = Trajectory(
+            waypoints=combined_waypoints,
+            total_distance=total_distance,
+            total_time=total_time,
+            estimated_battery_usage=battery_usage
+        )
+        
+        # Check for conflicts with other active flights
+        conflicts = detect_mission_conflicts(mission)
+        
+        if conflicts:
+            # Resolve conflicts
+            for conflict in conflicts:
+                resolved_trajectory, method = conflict_resolver.resolve_conflict(
+                    conflict, mission.trajectory, 
+                    flight_plans[conflict.drone_2_id]
+                )
+                mission.trajectory = resolved_trajectory
+                system_stats['conflicts_detected'] += 1
+                system_stats['conflicts_resolved'] += 1
+                
+                # Broadcast conflict resolution
+                await manager.broadcast({
+                    'type': 'conflict_resolved',
+                    'conflict': conflict.dict(),
+                    'resolution_method': method
+                })
+        
+        # Save mission and flight plan
         active_missions[mission_id] = mission
+        flight_plans[available_drone] = mission.trajectory
         system_stats['total_missions'] += 1
+        
+        # Update drone status
+        active_drones[available_drone].status = DroneStatus.ASSIGNED
+        
+        # Broadcast mission created
+        await manager.broadcast({
+            'type': 'mission_created',
+            'mission': mission.dict()
+        })
+        
         return {
             "mission_id": mission_id,
-            "status": "queued",
-            "message": "No drones available. Mission queued."
+            "drone_id": available_drone,
+            "status": "assigned",
+            "trajectory": mission.trajectory,
+            "conflicts_detected": len(conflicts)
         }
-    
-    # Assign drone and plan trajectory
-    mission.drone_id = available_drone
-    mission.assigned_at = time.time()
-    mission.status = DroneStatus.ASSIGNED
-    
-    # Plan trajectory
-    current_position = active_drones[available_drone].position
-    start_time = time.time()
-    
-    # Plan to pickup
-    trajectory_to_pickup = pathfinding.plan_trajectory(
-        current_position, request.pickup, start_time
-    )
-    
-    if not trajectory_to_pickup:
-        raise HTTPException(500, "Could not plan path to pickup location")
-    
-    # Plan from pickup to delivery
-    pickup_arrival_time = trajectory_to_pickup.waypoints[-1].eta
-    trajectory_to_delivery = pathfinding.plan_trajectory(
-        request.pickup, request.delivery, pickup_arrival_time + 30  # 30s for loading
-    )
-    
-    if not trajectory_to_delivery:
-        raise HTTPException(500, "Could not plan path to delivery location")
-    
-    # Combine trajectories
-    combined_waypoints = (trajectory_to_pickup.waypoints + 
-                         trajectory_to_delivery.waypoints)
-    
-    total_distance = (trajectory_to_pickup.total_distance + 
-                     trajectory_to_delivery.total_distance)
-    
-    total_time = (trajectory_to_delivery.waypoints[-1].eta - 
-                 trajectory_to_pickup.waypoints[0].eta)
-    
-    battery_usage = (trajectory_to_pickup.estimated_battery_usage + 
-                    trajectory_to_delivery.estimated_battery_usage)
-    
-    mission.trajectory = Trajectory(
-        waypoints=combined_waypoints,
-        total_distance=total_distance,
-        total_time=total_time,
-        estimated_battery_usage=battery_usage
-    )
-    
-    # Check for conflicts with other active flights
-    conflicts = detect_mission_conflicts(mission)
-    
-    if conflicts:
-        # Resolve conflicts
-        for conflict in conflicts:
-            resolved_trajectory, method = conflict_resolver.resolve_conflict(
-                conflict, mission.trajectory, 
-                flight_plans[conflict.drone_2_id]
-            )
-            mission.trajectory = resolved_trajectory
-            system_stats['conflicts_detected'] += 1
-            system_stats['conflicts_resolved'] += 1
-            
-            # Broadcast conflict resolution
-            await manager.broadcast({
-                'type': 'conflict_resolved',
-                'conflict': conflict.dict(),
-                'resolution_method': method
-            })
-    
-    # Save mission and flight plan
-    active_missions[mission_id] = mission
-    flight_plans[available_drone] = mission.trajectory
-    system_stats['total_missions'] += 1
-    
-    # Update drone status
-    active_drones[available_drone].status = DroneStatus.ASSIGNED
-    
-    # Broadcast mission created
-    await manager.broadcast({
-        'type': 'mission_created',
-        'mission': mission.dict()
-    })
-    
-    return {
-        "mission_id": mission_id,
-        "drone_id": available_drone,
-        "status": "assigned",
-        "trajectory": mission.trajectory,
-        "conflicts_detected": len(conflicts)
-    }
+    except Exception as e:
+        print("MISSION ERROR:", e)
+        raise
 
 @app.get("/api/missions")
 async def get_all_missions():

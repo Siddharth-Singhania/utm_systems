@@ -17,7 +17,7 @@ DRONE_BATTERY_CAPACITY = 3600.0  # Watt-hours
 DRONE_POWER_CONSUMPTION = 200.0  # Watts at cruise
 
 # Grid resolution for pathfinding
-GRID_RESOLUTION = 50  # meters (horizontal grid spacing)
+GRID_RESOLUTION = 100  # meters (horizontal grid spacing) 
 ALTITUDE_LAYERS = [30, 50, 70, 90, 110]  # Discrete altitude levels in meters
 
 # Conflict detection parameters
@@ -138,7 +138,7 @@ CONFLICT_CHECK_INTERVAL = 5.0  # seconds
 # API CONFIGURATION
 # ============================================================================
 
-API_HOST = "0.0.0.0"
+API_HOST = "127.0.0.1"
 API_PORT = 8000
 CORS_ORIGINS = ["*"]  # Allow all origins for development
 

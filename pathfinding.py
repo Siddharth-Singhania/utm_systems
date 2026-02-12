@@ -234,8 +234,10 @@ def plan_trajectory(start: Position, goal: Position, start_time: float) -> Optio
     start_node.f = start_node.h
     
     iterations = 0
-    max_iterations = 10000  # Prevent infinite loops
-    
+    max_iterations = 300000  # Prevent infinite loops
+    print("START:", start)
+    print("GOAL:", goal)
+
     while open_set and iterations < max_iterations:
         iterations += 1
         current = heapq.heappop(open_set)
@@ -243,8 +245,7 @@ def plan_trajectory(start: Position, goal: Position, start_time: float) -> Optio
         # Check if we reached the goal
         goal_distance = distance_3d(current.lat, current.lon, current.alt,
                                     goal.latitude, goal.longitude, goal.altitude)
-        if goal_distance < config.GRID_RESOLUTION:
-            # Reconstruct and convert path to trajectory
+        if goal_distance < config.GRID_RESOLUTION*1.5:            # Reconstruct and convert path to trajectory
             path = reconstruct_path(current)
             return nodes_to_trajectory(path)
         
@@ -252,6 +253,7 @@ def plan_trajectory(start: Position, goal: Position, start_time: float) -> Optio
         
         # Expand neighbors
         for neighbor in get_neighbors(current, goal.latitude, goal.longitude):
+            
             if neighbor in closed_set:
                 continue
             
@@ -271,16 +273,12 @@ def plan_trajectory(start: Position, goal: Position, start_time: float) -> Optio
             tentative_g = current.g + move_cost
             
             # Check if this path to neighbor is better
-            if neighbor not in open_set:
-                neighbor.g = tentative_g
-                neighbor.h = heuristic(neighbor, goal)
-                neighbor.f = neighbor.g + neighbor.h
-                neighbor.parent = current
-                heapq.heappush(open_set, neighbor)
-            elif tentative_g < neighbor.g:
-                neighbor.g = tentative_g
-                neighbor.f = neighbor.g + neighbor.h
-                neighbor.parent = current
+            neighbor.g = tentative_g
+            neighbor.h = heuristic(neighbor, goal)
+            neighbor.f = neighbor.g + neighbor.h
+            neighbor.parent = current
+            heapq.heappush(open_set, neighbor)
+                
     
     # No path found
     return None
