@@ -33,7 +33,7 @@ from models import (
 import config
 import uuid
 
-
+import anchors as anchor_registry
 # ── Type aliases ──────────────────────────────────────────────────────────────
 Vec3 = Tuple[float, float, float]   # (lat_m, lon_m, alt_m) in metres
 
@@ -237,6 +237,7 @@ def apply_delay(traj: Trajectory4D, extra_delay: float) -> Trajectory4D:
     )
 
 
+
 def reassign_stratum(traj: Trajectory4D,
                      new_stratum: int,
                      pickup_pos: Position,
@@ -244,18 +245,26 @@ def reassign_stratum(traj: Trajectory4D,
     """
     Return a new Trajectory4D with all CRUISE waypoints shifted to new_stratum,
     and CLIMB/DESCENT waypoints linearly interpolated to match.
-    The original ETA offsets and sigma_t values are preserved — only altitudes
-    and speeds change.
 
-    TERMINAL waypoints are distinguished as climb-side vs descent-side by
-    whether their index comes before or after the first CRUISE waypoint.
+    BUG FIX: anchor_bindings are now RE-COMPUTED for every waypoint at its
+    new altitude instead of being blindly copied from the old trajectory.
+
+    When reassign_stratum() copied the old bindings, two problems occurred:
+      1. expected_dist_m was computed at the old altitude — the WLS residuals
+         (measured − expected) had a large systematic bias, corrupting the
+         position-correction vector.
+      2. The node set was optimised for the old altitude geometry.  After a
+         30 m stratum change some of those nodes fall outside ANCHOR_MAX_RANGE,
+         while better-geometry nodes that are now in range go unused.
+
+    Recomputing via compute_anchor_bindings() costs one GDOP pass per waypoint
+    but runs entirely in the planning thread and is negligible compared to the
+    OSRM / CPA work that precedes it.
     """
     old_stratum = traj.stratum
     if old_stratum == 0:
         old_stratum = new_stratum
 
-    # Find the index of the first and last CRUISE waypoint to split
-    # the trajectory into climb-zone / cruise-zone / descent-zone.
     cruise_indices = [i for i, wp in enumerate(traj.waypoints)
                       if wp.phase == FlightPhase.CRUISE]
     first_cruise = cruise_indices[0]  if cruise_indices else len(traj.waypoints) // 2
@@ -277,10 +286,8 @@ def reassign_stratum(traj: Trajectory4D,
             new_alt = ratio * new_stratum
 
         elif wp.phase == FlightPhase.TERMINAL:
-            # Climb-side TERMINAL: before first cruise waypoint
-            # Descent-side TERMINAL: after last cruise waypoint
             ratio   = pos.altitude / old_stratum if old_stratum else 0
-            new_alt = ratio * new_stratum   # formula identical for both sides
+            new_alt = ratio * new_stratum
 
         else:
             new_alt = pos.altitude   # GROUND stays at 0
@@ -289,6 +296,16 @@ def reassign_stratum(traj: Trajectory4D,
         new_pos = Position(latitude=pos.latitude,
                            longitude=pos.longitude,
                            altitude=new_alt)
+
+        # ── FIX: recompute anchor bindings for the new altitude ───────────────
+        # The old bindings had expected_dist_m calibrated to the previous
+        # stratum altitude.  Using them at the new altitude produces large
+        # systematic WLS residuals and corrupts the position correction.
+        wp_xyz = anchor_registry._to_xyz(pos.latitude, pos.longitude,
+                                         min(new_alt, 130.0))
+        new_bindings, _, _ = anchor_registry.compute_anchor_bindings(wp_xyz)
+        # ─────────────────────────────────────────────────────────────────────
+
         new_wps.append(Waypoint4D(
             position=new_pos,
             eta=wp.eta,
@@ -296,7 +313,7 @@ def reassign_stratum(traj: Trajectory4D,
             heading=wp.heading,
             phase=wp.phase,
             sigma_t=wp.sigma_t,
-            anchor_bindings=wp.anchor_bindings,
+            anchor_bindings=new_bindings,   # ← was: wp.anchor_bindings
         ))
 
     return Trajectory4D(
@@ -309,7 +326,6 @@ def reassign_stratum(traj: Trajectory4D,
         stratum=new_stratum,
         direction=traj.direction,
     )
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFLICT CHECKER
