@@ -1,146 +1,151 @@
 """
 UTM System Configuration
-Defines operational parameters, geofencing zones, and system constraints
 """
 
-# ============================================================================
-# OPERATIONAL PARAMETERS
-# ============================================================================
+# ── Drone performance ─────────────────────────────────────────────────────────
+DRONE_MAX_SPEED         = 50.0    # m/s
+DRONE_MIN_SPEED         = 10.0    # m/s
+DRONE_CRUISE_SPEED      = 35.0    # m/s
+DRONE_MAX_ALTITUDE      = 130.0   # m  (top stratum ceiling)
+DRONE_MIN_ALTITUDE      = 20.0    # m  (legacy, kept for geofencing)
+DRONE_BATTERY_CAPACITY  = 3600.0  # Wh
+DRONE_POWER_CONSUMPTION = 200.0   # W at cruise
 
-# Drone performance characteristics
-DRONE_MAX_SPEED = 15.0  # m/s (approximately 54 km/h)
-DRONE_MIN_SPEED = 3.0   # m/s (minimum cruise speed)
-DRONE_CRUISE_SPEED = 10.0  # m/s (optimal speed)
-DRONE_MAX_ALTITUDE = 120.0  # meters (regulatory limit)
-DRONE_MIN_ALTITUDE = 20.0   # meters (minimum safe altitude)
-DRONE_BATTERY_CAPACITY = 3600.0  # Watt-hours
-DRONE_POWER_CONSUMPTION = 200.0  # Watts at cruise
+# Kinematic constants — fixed for all drones for consistent CPA math
+DRONE_CLIMB_RATE   = 3.0   # m/s vertical ascent
+DRONE_DESCENT_RATE = 2.0   # m/s vertical descent
 
-# Grid resolution for pathfinding
-GRID_RESOLUTION = 50  # meters (horizontal grid spacing)
-ALTITUDE_LAYERS = [30, 50, 70, 90, 110]  # Discrete altitude levels in meters
-
-# Conflict detection parameters
-HORIZONTAL_SEPARATION = 30.0  # meters (minimum horizontal distance)
-VERTICAL_SEPARATION = 15.0    # meters (minimum vertical distance)
-TIME_RESOLUTION = 5.0          # seconds (temporal discretization)
-LOOKAHEAD_TIME = 300.0         # seconds (5 minutes conflict prediction)
-
-# ============================================================================
-# ALTITUDE STRATIFICATION SYSTEM
-# ============================================================================
-# Highway lanes: Different altitudes for different cardinal directions
-# This passively reduces collision probability
-
-DIRECTION_ALTITUDE_MAP = {
-    'NORTH': [50, 90],      # Northbound drones use these altitudes
-    'SOUTH': [50, 90],      # Southbound drones use these altitudes
-    'EAST': [30, 70, 110],  # Eastbound drones use these altitudes
-    'WEST': [30, 70, 110],  # Westbound drones use these altitudes
+# ── Altitude stratification (direction-exclusive) ─────────────────────────────
+# Opposite-direction pairs are separated by ≥ 20 m, well above V_SEP=10 m.
+# This provides structural conflict avoidance before any CPA logic runs.
+#
+#  WEST 30 m          EAST 50 m   (gap = 20 m)
+#  SOUTH 40 m         NORTH 60 m  (gap = 20 m)
+#  DIAGONAL primary 80 m, with fallbacks 100 m and 120 m
+#
+DIRECTION_STRATA = {
+    'WEST':     30,
+    'SOUTH':    40,
+    'EAST':     50,
+    'NORTH':    60,
+    'DIAGONAL': 80,
 }
 
-# ============================================================================
-# GEOFENCING - NO-FLY ZONES
-# ============================================================================
-# Defined as polygons (lat, lon) with infinite vertical extent
-# Format: List of (latitude, longitude) tuples defining polygon vertices
+# All available strata in ascending order.
+# The resolver tries these when the assigned stratum is blocked.
+ALL_STRATA_ORDERED = [30, 40, 50, 60, 80, 100, 120]
 
+# ── CPA (Closest Point of Approach) parameters ────────────────────────────────
+CPA_R_BASE   = 30.0   # m  — static horizontal protection radius (GPS floor)
+CPA_SIGMA_0  = 2.0    # s  — irreducible timing uncertainty at launch
+CPA_DRIFT_K  = 0.001  # s/m — uncertainty growth rate (1 s per 1 km)
+CPA_V_SEP    = 10.0   # m  — minimum vertical separation
+
+# ── Terminal area ─────────────────────────────────────────────────────────────
+# Inside this cylinder around every pad, strata are suspended.
+# A FIFO pad queue ensures sequential use of each pad.
+TERMINAL_RADIUS       = 150.0   # m horizontal
+TERMINAL_HEIGHT       = 50.0    # m vertical ceiling of terminal area
+PAD_CLEARANCE_TIME    = 30.0    # s — gap between consecutive pad users
+
+# ── Resolution cascade limits ─────────────────────────────────────────────────
+MAX_TAKEOFF_DELAY       = 300.0  # s — reject beyond this
+MAX_RESOLUTION_PASSES   = 5      # full re-validation loops
+MAX_RESOLUTION_ATTEMPTS = 3      # per-conflict cascade attempts
+RESOLUTION_TIMEOUT      = 8.0    # s — wall-clock planning limit
+TEMPORAL_SAFETY_MARGIN  = 15.0   # s — added to combined sigma when computing delay
+
+# ── Legacy grid (kept for A* pathfinding internals) ──────────────────────────
+GRID_RESOLUTION  = 200
+ALTITUDE_LAYERS  = [30, 40, 50, 60, 80, 100, 120]
+
+# ── Geofencing ────────────────────────────────────────────────────────────────
 NO_FLY_ZONES = [
     {
         'name': 'Airport Restricted Airspace',
         'polygon': [
-            (37.6213, -122.3790),
-            (37.6213, -122.3590),
-            (37.6013, -122.3590),
-            (37.6013, -122.3790),
+            (37.6213, -122.3790), (37.6213, -122.3590),
+            (37.6013, -122.3590), (37.6013, -122.3790),
         ],
-        'cost_multiplier': float('inf')  # Absolute prohibition
+        'cost_multiplier': 999999.0
     },
     {
-        'name': 'Military Base',
+        'name': 'Presidio Military Reserve',
         'polygon': [
-            (37.7850, -122.4100),
-            (37.7850, -122.3900),
-            (37.7650, -122.3900),
-            (37.7650, -122.4100),
+            (37.8080, -122.5120), (37.8080, -122.4440),
+            (37.7900, -122.4440), (37.7900, -122.5120),
         ],
-        'cost_multiplier': float('inf')
-    }
+        'cost_multiplier': 999999.0
+    },
 ]
-
-# ============================================================================
-# SENSITIVE AREAS (High Cost, Not Prohibited)
-# ============================================================================
-# Areas where flight is discouraged but not forbidden
-# These receive elevated costs in pathfinding to naturally route around them
 
 SENSITIVE_AREAS = [
     {
         'name': 'Elementary School Zone',
         'polygon': [
-            (37.7700, -122.4350),
-            (37.7700, -122.4300),
-            (37.7650, -122.4300),
-            (37.7650, -122.4350),
+            (37.7700, -122.4350), (37.7700, -122.4300),
+            (37.7650, -122.4300), (37.7650, -122.4350),
         ],
-        'cost_multiplier': 5.0  # 5x normal cost
+        'cost_multiplier': 5.0
     },
     {
         'name': 'Hospital Complex',
         'polygon': [
-            (37.7550, -122.4050),
-            (37.7550, -122.4000),
-            (37.7500, -122.4000),
-            (37.7500, -122.4050),
+            (37.7550, -122.4050), (37.7550, -122.4000),
+            (37.7500, -122.4000), (37.7500, -122.4050),
         ],
-        'cost_multiplier': 4.0  # 4x normal cost
+        'cost_multiplier': 4.0
     },
     {
         'name': 'Residential High Density',
         'polygon': [
-            (37.7400, -122.4200),
-            (37.7400, -122.4100),
-            (37.7300, -122.4100),
-            (37.7300, -122.4200),
+            (37.7400, -122.4200), (37.7400, -122.4100),
+            (37.7300, -122.4100), (37.7300, -122.4200),
         ],
-        'cost_multiplier': 2.0  # 2x normal cost
-    }
+        'cost_multiplier': 2.0
+    },
 ]
 
-# ============================================================================
-# OPERATIONAL BOUNDS
-# ============================================================================
-# Geographic boundary for the UTM system (Expanded San Francisco Bay Area)
-
 OPERATIONAL_AREA = {
-    'min_lat': 37.50,
-    'max_lat': 37.90,
-    'min_lon': -122.55,
-    'max_lon': -122.25
+    'min_lat': 37.50, 'max_lat': 37.90,
+    'min_lon': -122.55, 'max_lon': -122.25
 }
 
-# ============================================================================
-# SIMULATION PARAMETERS
-# ============================================================================
+# ── API ───────────────────────────────────────────────────────────────────────
+API_HOST  = "0.0.0.0"
+API_PORT  = 8000
+CORS_ORIGINS = ["*"]
 
-# Virtual drone fleet size
-SIMULATION_FLEET_SIZE = 10
+SIMULATION_FLEET_SIZE    = 10
+MISSION_INTERVAL         = 30
+MISSION_TIMEOUT          = 600
+TELEMETRY_UPDATE_RATE    = 2.0
+CONFLICT_CHECK_INTERVAL  = 5.0
+WS_HEARTBEAT_INTERVAL    = 30
 
-# Delivery mission parameters
-MISSION_INTERVAL = 30  # seconds between mission assignments
-MISSION_TIMEOUT = 600   # seconds before mission is considered failed
+# ── GPS-Denied / UWB Ranging ──────────────────────────────────────────────────
+# Noise model:  σᵢ = UWB_SIGMA_0 + UWB_DRIFT_K * d̂ᵢ
+# Represents physical UWB radio ranging uncertainty growing with distance.
+UWB_SIGMA_0       = 0.5     # m — constant floor noise (GPS-denied)
+UWB_DRIFT_K       = 0.005   # m/m — distance-proportional noise (0.5% of range)
 
-# Update rates
-TELEMETRY_UPDATE_RATE = 2.0  # Hz (updates per second)
-CONFLICT_CHECK_INTERVAL = 5.0  # seconds
+# Anchor selection per waypoint
+ANCHOR_MAX_RANGE  = 2500.0  # m — ranging radius; 2.5 km suits the 25-node SF grid
+ANCHOR_MIN_COUNT  = 4       # minimum nodes required for a valid WLS fix
+ANCHOR_MAX_COUNT  = 6       # maximum nodes used per waypoint (GDOP-optimised)
 
-# ============================================================================
-# API CONFIGURATION
-# ============================================================================
+# GDOP thresholds — split into horizontal and vertical components
+HDOP_THRESHOLD    = 3.0     # above this: fall back to dead reckoning (horizontal)
+VDOP_THRESHOLD    = 3.0     # above this: zero out vertical correction (use baro)
 
-API_HOST = "127.0.0.1"
-API_PORT = 8000
-CORS_ORIGINS = ["*"]  # Allow all origins for development
+# WLS correction parameters
+WLS_CORRECTION_TAU = 3.0    # s — time window to apply velocity correction
 
-# WebSocket configuration
-WS_HEARTBEAT_INTERVAL = 30  # seconds
+# ── Legacy ────────────────────────────────────────────────────────────────────
+HORIZONTAL_SEPARATION = CPA_R_BASE
+VERTICAL_SEPARATION   = CPA_V_SEP
+TIME_RESOLUTION       = 5.0
+LOOKAHEAD_TIME        = 300.0
+DIRECTION_ALTITUDE_MAP = {
+    'NORTH': [60], 'SOUTH': [40], 'EAST': [50], 'WEST': [30],
+}

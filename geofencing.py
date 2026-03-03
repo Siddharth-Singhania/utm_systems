@@ -42,23 +42,17 @@ def point_in_polygon(point: Tuple[float, float], polygon: List[Tuple[float, floa
 
 
 def is_in_no_fly_zone(position: Position) -> bool:
-    """
-    Check if a position violates any no-fly zone
-    
-    Args:
-        position: Position to check
-    
-    Returns:
-        True if position is in a no-fly zone, False otherwise
-    """
+    """Check if a position violates any no-fly zone in 3D space."""
     point = (position.latitude, position.longitude)
     
     for zone in config.NO_FLY_ZONES:
         if point_in_polygon(point, zone['polygon']):
-            return True
-    
+            # If the zone has a max altitude, and the drone is above it, it is safe.
+            zone_alt_max = zone.get('altitude_max', float('inf'))
+            if position.altitude <= zone_alt_max:
+                return True
+                
     return False
-
 
 def get_position_cost_multiplier(position: Position) -> float:
     """
@@ -169,3 +163,58 @@ def get_geofence_info() -> dict:
         'sensitive_areas': config.SENSITIVE_AREAS,
         'operational_area': config.OPERATIONAL_AREA
     }
+
+
+# ── Water body detection ──────────────────────────────────────────────────────
+# Piecewise-linear SF shoreline derived from OSM coastline data.
+# East side = SF Bay, West side = Pacific Ocean.
+
+# Each tuple is (latitude, bay_longitude_threshold).
+# Points with lon > threshold at that latitude are in the bay.
+_BAY_BOUNDARY = [
+    (37.50, -122.315),
+    (37.56, -122.325),
+    (37.58, -122.330),
+    (37.60, -122.335),
+    (37.62, -122.345),
+    (37.65, -122.358),
+    (37.68, -122.365),
+    (37.71, -122.370),
+    (37.74, -122.376),
+    (37.77, -122.383),
+    (37.79, -122.390),
+    (37.81, -122.397),
+    (37.83, -122.408),
+    (37.90, -122.430),
+]
+
+# Great Highway / Ocean Beach — anything west of this is Pacific Ocean
+_PACIFIC_LON = -122.511
+
+
+def _bay_threshold(lat: float) -> float:
+    """Interpolated bay shoreline longitude for a given latitude."""
+    pts = _BAY_BOUNDARY
+    if lat <= pts[0][0]:
+        return pts[0][1]
+    if lat >= pts[-1][0]:
+        return pts[-1][1]
+    for i in range(len(pts) - 1):
+        la0, lo0 = pts[i]
+        la1, lo1 = pts[i + 1]
+        if la0 <= lat <= la1:
+            t = (lat - la0) / (la1 - la0)
+            return lo0 + t * (lo1 - lo0)
+    return pts[-1][1]
+
+
+def is_over_water(lat: float, lon: float) -> str | None:
+    """
+    Return a description string if the point is over water, or None if on land.
+    Checks Pacific Ocean (west) and SF Bay (east).
+    """
+    if lon <= _PACIFIC_LON:
+        return "the Pacific Ocean"
+    if lon > _bay_threshold(lat):
+        return "San Francisco Bay"
+    return None
