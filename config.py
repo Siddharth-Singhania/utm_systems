@@ -10,10 +10,13 @@ DRONE_MAX_ALTITUDE      = 130.0   # m  (top stratum ceiling)
 DRONE_MIN_ALTITUDE      = 20.0    # m  (legacy, kept for geofencing)
 DRONE_BATTERY_CAPACITY  = 3600.0  # Wh
 DRONE_POWER_CONSUMPTION = 200.0   # W at cruise
+DRONE_ACCEL_LIMIT  = 2.0   # m/s²  — max longitudinal acceleration / braking
+DRONE_TURN_MAX_G   = 1.5   # g     — max lateral acceleration in a banked turn
 
 # Kinematic constants — fixed for all drones for consistent CPA math
 DRONE_CLIMB_RATE   = 3.0   # m/s vertical ascent
-DRONE_DESCENT_RATE = 2.0   # m/s vertical descent
+DRONE_DESCENT_RATE = 2.0   # m/s vertical 
+
 
 # ── Altitude stratification (direction-exclusive) ─────────────────────────────
 # Opposite-direction pairs are separated by ≥ 20 m, well above V_SEP=10 m.

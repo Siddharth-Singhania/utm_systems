@@ -251,6 +251,32 @@ body {
     transform: translateY(-2px);
     box-shadow: 0 15px 40px rgba(239, 68, 68, 0.4);
 }
+.conflict-btn {
+    border-color: rgba(245, 158, 11, 0.35) !important;
+}
+.conflict-btn:hover {
+    border-color: var(--accent-warning) !important;
+    background: rgba(245, 158, 11, 0.1) !important;
+}
+.demo-btn-badge.altitude {
+    background: rgba(245, 158, 11, 0.2);
+    color: #fbbf24;
+    border: 1px solid rgba(245, 158, 11, 0.4);
+}
+.demo-btn-badge.delay {
+    background: rgba(239, 68, 68, 0.2);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.4);
+}
+.btn-conflict {
+    background: linear-gradient(135deg, #f59e0b, #b45309);
+    color: white;
+    box-shadow: 0 10px 30px rgba(245, 158, 11, 0.25);
+}
+.btn-conflict:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 15px 40px rgba(245, 158, 11, 0.4);
+}
 
 /* Form Styles */
 .form-group {

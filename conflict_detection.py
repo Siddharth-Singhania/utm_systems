@@ -36,7 +36,7 @@ import uuid
 import anchors as anchor_registry
 # ── Type aliases ──────────────────────────────────────────────────────────────
 Vec3 = Tuple[float, float, float]   # (lat_m, lon_m, alt_m) in metres
-
+PAD_QUEUE_ENABLED = False
 
 # ── Coordinate helpers ────────────────────────────────────────────────────────
 _LAT_M  = 111_319.5   # metres per degree of latitude

@@ -11,8 +11,9 @@ plan_trajectory(start, goal,
 Internal pipeline
 -----------------
 Level 1  OSRM direct road route        validated against no-fly zones
-Level 2  OSRM blocked -> A* bypass corners snapped to nearest road
-Level 3  Pure visibility-graph A*      (last resort, no road guarantee)
+Level 2  OSRM blocked -> Yen's K=5 visibility graph bypass,
+         corners snapped to nearest road, chained OSRM route
+Level 3  Pure Yen's K=5 visibility graph A*  (last resort, no road guarantee)
 
 After a 2-D road path is found, build_4d_trajectory() converts it into a
 full Trajectory4D with:
@@ -23,6 +24,13 @@ full Trajectory4D with:
   - GROUND waypoint at z=0 on the delivery pad
   - sigma_t accumulated per waypoint (ETA uncertainty cone)
   - phase tag on every waypoint
+  - turn-adjusted speed per CRUISE waypoint (cosine model + accel penalty)
+
+Time-Optimal Routing (Yen's K=5)
+---------------------------------
+visibility_graph_astar() generates up to K=5 loopless candidate paths,
+scores each with get_path_travel_time() (segment time + turn accel penalty),
+and returns the time-optimal candidate rather than the shortest-distance one.
 """
 
 import math
@@ -44,11 +52,15 @@ OSRM_TIMEOUT = 8
 
 BUFFER_DEGREES = 0.0007   # ~78 m clearance around no-fly zone corners
 
+# Number of candidate paths Yen's algorithm generates before selecting
+# the time-optimal one.
+_YENS_K = 5
+
 LatLon = Tuple[float, float]   # (latitude, longitude)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CORE GEOMETRY  (also imported by conflict_detection.py)
+# CORE GEOMETRY
 # ══════════════════════════════════════════════════════════════════════════════
 
 def haversine_distance(lat1: float, lon1: float,
@@ -185,7 +197,76 @@ def fetch_osrm_route_via_positions(positions: List[Position]) -> Optional[List[L
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VISIBILITY GRAPH A*
+# TURN-SPEED MODEL
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _turn_speed(prev_heading: float, next_heading: float,
+                cruise: float, min_speed: float) -> float:
+    """
+    Scale cruise speed down proportionally to the sharpness of a turn.
+
+    Turn angle 0°   → full cruise speed  (straight ahead)
+    Turn angle 90°  → 50% cruise speed   (right-angle turn)
+    Turn angle 180° → min_speed          (U-turn)
+
+    Uses a cosine curve:  speed = cruise * 0.5 * (1 + cos(turn_rad))
+    clamped to [min_speed, cruise].
+    """
+    delta = abs(next_heading - prev_heading) % 360
+    if delta > 180:
+        delta = 360 - delta
+    turn_rad = math.radians(delta)
+    scaled   = cruise * 0.5 * (1.0 + math.cos(turn_rad))
+    return max(min_speed, scaled)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TIME-COST MODEL
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_path_travel_time(latlon_path: List[LatLon]) -> float:
+    """
+    Estimate total flight time for a 2-D road/visibility path.
+
+    For each segment:
+      base_time     = segment_dist / turn_speed
+      accel_penalty = 2 * (cruise - turn_speed) / DRONE_ACCEL_LIMIT
+                      (time to brake into the corner + re-accelerate out)
+
+    The first segment has no incoming heading so no penalty is applied.
+    Returns total estimated seconds.
+    """
+    cruise   = config.DRONE_CRUISE_SPEED
+    accel    = config.DRONE_ACCEL_LIMIT
+    min_spd  = config.DRONE_MIN_SPEED
+    total    = 0.0
+    prev_hdg = None
+
+    for i in range(len(latlon_path) - 1):
+        p1   = latlon_path[i]
+        p2   = latlon_path[i + 1]
+        dist = haversine_distance(p1[0], p1[1], p2[0], p2[1])
+        if dist < 1e-3:
+            continue
+
+        hdg = calculate_heading(p1[0], p1[1], p2[0], p2[1])
+
+        if prev_hdg is None:
+            spd     = cruise
+            penalty = 0.0
+        else:
+            spd     = _turn_speed(prev_hdg, hdg, cruise, min_spd)
+            delta_v = cruise - spd
+            penalty = 2.0 * delta_v / accel if delta_v > 0.1 else 0.0
+
+        total   += dist / spd + penalty
+        prev_hdg = hdg
+
+    return total
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VISIBILITY GRAPH HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _buffered_vertices(polygon: List[LatLon]) -> List[LatLon]:
@@ -207,30 +288,40 @@ def _edge_cost(p1: LatLon, p2: LatLon) -> float:
     return dist * geofencing.get_position_cost_multiplier(mid)
 
 
-def visibility_graph_astar(start: LatLon, goal: LatLon) -> Optional[List[LatLon]]:
-    node_set: List[LatLon] = [start, goal]
-    for zone in config.NO_FLY_ZONES:
-        node_set.extend(_buffered_vertices(zone['polygon']))
+# ══════════════════════════════════════════════════════════════════════════════
+# LOW-LEVEL A* ON A PRE-BUILT NODE SET  (inner loop for Yen's)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    seen: set = set()
-    nodes: List[LatLon] = []
-    for pt in node_set:
-        key = (round(pt[0], 7), round(pt[1], 7))
-        if key not in seen:
-            seen.add(key)
-            nodes.append(pt)
+def _astar_on_graph(
+    nodes:         List[LatLon],
+    blocked_edges: set,
+    blocked_nodes: set,
+    start_idx:     int,
+    goal_idx:      int,
+) -> Optional[List[int]]:
+    """
+    A* over a visibility graph defined by `nodes`.
 
-    nodes[0] = start
-    nodes[1] = goal
+    An edge (i→j) is traversable if:
+      - neither i nor j is in blocked_nodes
+      - frozenset({i,j}) is not in blocked_edges
+      - the straight line between nodes[i] and nodes[j] clears all no-fly zones
+
+    Returns an ordered list of node indices, or None if unreachable.
+    """
     n = len(nodes)
 
     def h(i: int) -> float:
-        return haversine_distance(nodes[i][0], nodes[i][1], goal[0], goal[1])
+        return haversine_distance(
+            nodes[i][0], nodes[i][1],
+            nodes[goal_idx][0], nodes[goal_idx][1]
+        )
 
-    INF = float('inf')
-    g_score  = [INF] * n;  g_score[0] = 0.0
-    came_from = [-1] * n
-    heap = [(h(0), 0.0, 0)]
+    INF       = float('inf')
+    g_score   = [INF] * n
+    came_from = [-1]  * n
+    g_score[start_idx] = 0.0
+    heap   = [(h(start_idx), 0.0, start_idx)]
     closed: set = set()
 
     while heap:
@@ -238,26 +329,171 @@ def visibility_graph_astar(start: LatLon, goal: LatLon) -> Optional[List[LatLon]
         if cur in closed:
             continue
         closed.add(cur)
-        if cur == 1:
-            path: List[LatLon] = []
-            idx = 1
+
+        if cur == goal_idx:
+            path: List[int] = []
+            idx = goal_idx
             while idx != -1:
-                path.append(nodes[idx])
+                path.append(idx)
                 idx = came_from[idx]
             path.reverse()
-            print(f"[A*] ✓ {len(path)}-node path found")
             return path
+
         for nxt in range(n):
-            if nxt in closed or not _segment_is_clear(nodes[cur], nodes[nxt]):
+            if nxt == cur:
                 continue
+            if nxt in blocked_nodes and nxt != goal_idx:
+                continue
+            if cur in blocked_nodes and cur != start_idx:
+                continue
+            if frozenset((cur, nxt)) in blocked_edges:
+                continue
+            if not _segment_is_clear(nodes[cur], nodes[nxt]):
+                continue
+
             tg = g + _edge_cost(nodes[cur], nodes[nxt])
             if tg < g_score[nxt]:
-                g_score[nxt] = tg
+                g_score[nxt]   = tg
                 came_from[nxt] = cur
                 heapq.heappush(heap, (tg + h(nxt), tg, nxt))
 
-    print("[A*] No path found")
     return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# YEN'S K-SHORTEST PATHS  →  TIME-OPTIMAL SELECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def visibility_graph_astar(start: LatLon, goal: LatLon) -> Optional[List[LatLon]]:
+    """
+    Find the TIME-OPTIMAL path between start and goal using Yen's K-shortest
+    loopless paths algorithm (K = _YENS_K) on the visibility graph.
+
+    Steps
+    -----
+    1. Build node set: start, goal, buffered no-fly zone vertices.
+    2. A[0] = shortest path by geofencing-weighted edge cost.
+    3. For k = 1 … K-1:
+         For each spur node in A[k-1]:
+           Block edges used by confirmed paths with the same root prefix.
+           Block all root nodes except the spur node.
+           Run _astar_on_graph from spur node to goal.
+           Add root + spur to candidate heap B if not already seen.
+         A[k] = lowest-cost candidate from B.
+    4. Score all confirmed paths with get_path_travel_time().
+    5. Return the path with the lowest travel time.
+    """
+    # ── 1. Build node set ─────────────────────────────────────────────────────
+    raw_nodes: List[LatLon] = [start, goal]
+    for zone in config.NO_FLY_ZONES:
+        raw_nodes.extend(_buffered_vertices(zone['polygon']))
+
+    seen_keys: set = set()
+    nodes: List[LatLon] = []
+    for pt in raw_nodes:
+        key = (round(pt[0], 7), round(pt[1], 7))
+        if key not in seen_keys:
+            seen_keys.add(key)
+            nodes.append(pt)
+
+    nodes[0] = start
+    nodes[1] = goal
+    START, GOAL = 0, 1
+
+    # ── 2. Find A[0] ──────────────────────────────────────────────────────────
+    first = _astar_on_graph(nodes, set(), set(), START, GOAL)
+    if first is None:
+        print("[Yen's] No base path found")
+        return None
+
+    confirmed: List[List[int]] = [first]
+    candidates: list = []   # heap of (edge_cost, uid, path_indices)
+    _uid = 0
+
+    print(f"[Yen's] Base path: {len(first)} nodes, "
+          f"time={get_path_travel_time([nodes[i] for i in first]):.1f}s")
+
+    # ── 3. Yen's main loop ────────────────────────────────────────────────────
+    for k in range(1, _YENS_K):
+        prev_path = confirmed[k - 1]
+
+        for spur_idx in range(len(prev_path) - 1):
+            spur_node  = prev_path[spur_idx]
+            root_nodes = prev_path[:spur_idx + 1]
+
+            blocked_edges: set = set()
+            blocked_nodes: set = set()
+
+            # Block edges used by confirmed paths sharing this root prefix
+            for cp in confirmed:
+                if (len(cp) > spur_idx and
+                        cp[:spur_idx + 1] == root_nodes):
+                    blocked_edges.add(
+                        frozenset((cp[spur_idx], cp[spur_idx + 1]))
+                    )
+
+            # Block edges used by candidates sharing this root prefix
+            for _, _, cand_path in candidates:
+                if (len(cand_path) > spur_idx and
+                        cand_path[:spur_idx + 1] == root_nodes):
+                    blocked_edges.add(
+                        frozenset((cand_path[spur_idx], cand_path[spur_idx + 1]))
+                    )
+
+            # Block all root nodes except the spur node itself
+            for node_idx in root_nodes[:-1]:
+                blocked_nodes.add(node_idx)
+
+            spur_path = _astar_on_graph(
+                nodes, blocked_edges, blocked_nodes, spur_node, GOAL
+            )
+
+            if spur_path is not None:
+                full_path = root_nodes[:-1] + spur_path
+
+                already_confirmed = any(full_path == cp for cp in confirmed)
+                already_candidate = any(full_path == cp for _, _, cp in candidates)
+
+                if not already_confirmed and not already_candidate:
+                    cost = sum(
+                        _edge_cost(nodes[full_path[j]], nodes[full_path[j + 1]])
+                        for j in range(len(full_path) - 1)
+                    )
+                    heapq.heappush(candidates, (cost, _uid, full_path))
+                    _uid += 1
+
+        if not candidates:
+            print(f"[Yen's] No more candidates after k={k}, stopping early")
+            break
+
+        _, _, best_cand = heapq.heappop(candidates)
+        confirmed.append(best_cand)
+
+        travel_t = get_path_travel_time([nodes[i] for i in best_cand])
+        print(f"[Yen's] k={k}: {len(best_cand)} nodes, time={travel_t:.1f}s")
+
+    # ── 4. Score all confirmed paths by travel time ────────────────────────────
+    scored = []
+    for idx_path in confirmed:
+        latlon = [nodes[i] for i in idx_path]
+        t      = get_path_travel_time(latlon)
+        dist   = sum(
+            haversine_distance(
+                latlon[j][0], latlon[j][1],
+                latlon[j+1][0], latlon[j+1][1]
+            )
+            for j in range(len(latlon) - 1)
+        )
+        scored.append((t, latlon))
+        print(f"[Yen's] Candidate {len(scored)}: "
+              f"{len(latlon)} nodes, dist={dist:.0f}m, time={t:.1f}s")
+
+    scored.sort(key=lambda x: x[0])
+    best_time, best_path = scored[0]
+    print(f"[Yen's] ✓ Time-optimal: {len(best_path)} nodes, "
+          f"time={best_time:.1f}s")
+
+    return best_path
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -280,27 +516,18 @@ def _thin_path(points: List[LatLon], min_dist_m: float = 25.0) -> List[LatLon]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def bearing_to_direction(heading: float) -> str:
-    """Map heading (0-360) to cardinal direction string."""
     h = heading % 360
-    if 337.5 <= h or h < 22.5:
-        return 'NORTH'
-    if 22.5 <= h < 67.5:
-        return 'DIAGONAL'
-    if 67.5 <= h < 112.5:
-        return 'EAST'
-    if 112.5 <= h < 157.5:
-        return 'DIAGONAL'
-    if 157.5 <= h < 202.5:
-        return 'SOUTH'
-    if 202.5 <= h < 247.5:
-        return 'DIAGONAL'
-    if 247.5 <= h < 292.5:
-        return 'WEST'
+    if 337.5 <= h or h < 22.5:   return 'NORTH'
+    if 22.5  <= h < 67.5:         return 'DIAGONAL'
+    if 67.5  <= h < 112.5:        return 'EAST'
+    if 112.5 <= h < 157.5:        return 'DIAGONAL'
+    if 157.5 <= h < 202.5:        return 'SOUTH'
+    if 202.5 <= h < 247.5:        return 'DIAGONAL'
+    if 247.5 <= h < 292.5:        return 'WEST'
     return 'DIAGONAL'
 
 
 def direction_to_stratum(direction: str) -> int:
-    """Return the primary stratum (metres) for a given direction."""
     return config.DIRECTION_STRATA.get(direction, 80)
 
 
@@ -310,13 +537,11 @@ def direction_to_stratum(direction: str) -> int:
 
 def _is_in_terminal_area(lat: float, lon: float, alt: float,
                           pad_lat: float, pad_lon: float) -> bool:
-    """True if point is within the terminal cylinder of a pad."""
     h = haversine_distance(lat, lon, pad_lat, pad_lon)
     return h <= config.TERMINAL_RADIUS and alt <= config.TERMINAL_HEIGHT
 
 
 def _compute_sigma_t(cumulative_arc_m: float) -> float:
-    """Timing uncertainty at a given arc-distance from launch."""
     return config.CPA_SIGMA_0 + config.CPA_DRIFT_K * cumulative_arc_m
 
 
@@ -329,42 +554,23 @@ def build_4d_trajectory(latlon_path: List[LatLon],
     """
     Convert a 2-D road path into a full 4-D trajectory.
 
-    Synthetic waypoints are inserted for:
-      - Launch pad (z=0, GROUND)
-      - Climb from z=0 to stratum (TERMINAL then CLIMB)
-      - Cruise at stratum (CRUISE)
-      - Descent from stratum to z=0 (DESCENT then TERMINAL)
-      - Delivery pad (z=0, GROUND)
-
-    sigma_t is accumulated per waypoint based on cumulative arc-length.
-    The drone travels horizontally while climbing/descending — the horizontal
-    distance covered during climb/descent is sliced off the first/last
-    road segments so waypoints remain on the route.
+    Synthetic waypoints are inserted for GROUND / TERMINAL / CLIMB /
+    CRUISE / DESCENT phases.  CRUISE waypoints use turn-adjusted speeds
+    (cosine model) so that ETA and sigma_t values are accurate for CPA.
     """
     cruise_speed  = config.DRONE_CRUISE_SPEED
     climb_rate    = config.DRONE_CLIMB_RATE
     descent_rate  = config.DRONE_DESCENT_RATE
 
-    # Time to reach cruise stratum from ground (and back)
-    climb_time   = stratum / climb_rate      # seconds
-    descent_time = stratum / descent_rate    # seconds
+    climb_time     = stratum / climb_rate
+    descent_time   = stratum / descent_rate
+    climb_h_dist   = cruise_speed * climb_time
+    descent_h_dist = cruise_speed * descent_time
 
-    # Horizontal distance covered during climb/descent at cruise speed
-    climb_h_dist   = cruise_speed * climb_time    # metres
-    descent_h_dist = cruise_speed * descent_time  # metres
-
-    # ── Walk road path to find climb endpoint and descent startpoint ──────────
-    # We advance along the path until we've covered climb_h_dist metres —
-    # that point is where the drone reaches cruise altitude.
-    # We do the same from the end for descent.
+    # ── Walk path to find climb endpoint and descent startpoint ──────────────
 
     def walk_path_forward(path: List[LatLon], target_dist: float
                           ) -> Tuple[LatLon, int, float]:
-        """
-        Walk forward along path until target_dist is covered.
-        Returns (interpolated_point, segment_index_reached, overshoot).
-        If path is shorter than target_dist, returns path[-1].
-        """
         d = 0.0
         for i in range(len(path) - 1):
             seg = haversine_distance(path[i][0], path[i][1],
@@ -379,7 +585,6 @@ def build_4d_trajectory(latlon_path: List[LatLon],
 
     def walk_path_backward(path: List[LatLon], target_dist: float
                            ) -> Tuple[LatLon, int]:
-        """Walk backward from path end. Returns (interpolated_point, index)."""
         d = 0.0
         for i in range(len(path)-1, 0, -1):
             seg = haversine_distance(path[i][0], path[i][1],
@@ -398,38 +603,36 @@ def build_4d_trajectory(latlon_path: List[LatLon],
         for i in range(len(latlon_path)-1)
     )
 
-    # Cap climb/descent distances so they never exceed half the path
-    max_one_side = total_path_len * 0.4
+    max_one_side   = total_path_len * 0.4
     climb_h_dist   = min(climb_h_dist,   max_one_side)
     descent_h_dist = min(descent_h_dist, max_one_side)
 
-    climb_end_pt, climb_end_idx, _ = walk_path_forward(latlon_path, climb_h_dist)
-    descent_start_pt, descent_start_idx = walk_path_backward(latlon_path, descent_h_dist)
+    climb_end_pt,     climb_end_idx,    _ = walk_path_forward(latlon_path, climb_h_dist)
+    descent_start_pt, descent_start_idx   = walk_path_backward(latlon_path, descent_h_dist)
 
-    # If climb_end is past descent_start (very short route), use midpoint for both
     if climb_end_idx >= descent_start_idx:
         mid_lat = (latlon_path[0][0] + latlon_path[-1][0]) / 2
         mid_lon = (latlon_path[0][1] + latlon_path[-1][1]) / 2
-        climb_end_pt     = (mid_lat, mid_lon)
-        descent_start_pt = (mid_lat, mid_lon)
-        climb_end_idx    = len(latlon_path) // 2
+        climb_end_pt      = (mid_lat, mid_lon)
+        descent_start_pt  = (mid_lat, mid_lon)
+        climb_end_idx     = len(latlon_path) // 2
         descent_start_idx = climb_end_idx
 
-    # ── Build list of (lat, lon, alt, phase) tuples ───────────────────────────
+    # ── Build (lat, lon, alt, phase) segments ────────────────────────────────
     segments: List[Tuple[float, float, float, FlightPhase]] = []
 
-    pick_lat = pickup_pos.latitude
-    pick_lon = pickup_pos.longitude
+    pick_lat  = pickup_pos.latitude
+    pick_lon  = pickup_pos.longitude
     deliv_lat = delivery_pos.latitude
     deliv_lon = delivery_pos.longitude
 
-    # 1. Launch pad — ground
+    # 1. Launch pad
     segments.append((pick_lat, pick_lon, 0.0, FlightPhase.GROUND))
 
-    # 2. Climb: linearly from z=0 to stratum, horizontally from pad to climb_end
-    N_CLIMB = 4   # synthetic intermediate waypoints during climb
+    # 2. Climb
+    N_CLIMB = 4
     for k in range(1, N_CLIMB + 1):
-        t = k / N_CLIMB
+        t   = k / N_CLIMB
         lat = pick_lat + t * (climb_end_pt[0] - pick_lat)
         lon = pick_lon + t * (climb_end_pt[1] - pick_lon)
         alt = t * stratum
@@ -438,15 +641,14 @@ def build_4d_trajectory(latlon_path: List[LatLon],
                  else FlightPhase.CLIMB)
         segments.append((lat, lon, alt, phase))
 
-    # 3. Cruise: road waypoints between climb_end and descent_start
-    cruise_pts = latlon_path[climb_end_idx+1 : descent_start_idx]
-    for lat, lon in cruise_pts:
+    # 3. Cruise
+    for lat, lon in latlon_path[climb_end_idx+1 : descent_start_idx]:
         segments.append((lat, lon, float(stratum), FlightPhase.CRUISE))
 
-    # 4. Descent: from descent_start to delivery pad
+    # 4. Descent
     N_DESCENT = 4
     for k in range(1, N_DESCENT + 1):
-        t = k / N_DESCENT
+        t   = k / N_DESCENT
         lat = descent_start_pt[0] + t * (deliv_lat - descent_start_pt[0])
         lon = descent_start_pt[1] + t * (deliv_lon - descent_start_pt[1])
         alt = stratum * (1.0 - t)
@@ -455,11 +657,11 @@ def build_4d_trajectory(latlon_path: List[LatLon],
                  else FlightPhase.DESCENT)
         segments.append((lat, lon, alt, phase))
 
-    # 5. Delivery pad — ground
+    # 5. Delivery pad
     segments.append((deliv_lat, deliv_lon, 0.0, FlightPhase.GROUND))
 
-    # ── Compute ETAs, sigma_t, and anchor bindings for every segment ──────────
-    waypoints4d: List[Waypoint4D] = []
+    # ── Compute ETAs, sigma_t, anchor bindings ────────────────────────────────
+    waypoints4d:   List[Waypoint4D] = []
     current_time   = start_time
     cumulative_arc = 0.0
     total_dist     = 0.0
@@ -467,13 +669,14 @@ def build_4d_trajectory(latlon_path: List[LatLon],
     prev_lat, prev_lon, prev_alt = segments[0][:3]
 
     for i, (lat, lon, alt, phase) in enumerate(segments):
+
         if i == 0:
             overall_heading = calculate_heading(
                 segments[0][0], segments[0][1],
                 segments[-1][0], segments[-1][1]
             )
-            sigma = _compute_sigma_t(0.0)
-            wp_xyz = anchor_registry._to_xyz(lat, lon, alt)
+            sigma    = _compute_sigma_t(0.0)
+            wp_xyz   = anchor_registry._to_xyz(lat, lon, alt)
             bindings, _, _ = anchor_registry.compute_anchor_bindings(wp_xyz)
             waypoints4d.append(Waypoint4D(
                 position=Position(latitude=lat, longitude=lon, altitude=alt),
@@ -486,32 +689,42 @@ def build_4d_trajectory(latlon_path: List[LatLon],
             ))
             continue
 
-        # 3-D distance for time calculation
         seg_3d = distance_3d(prev_lat, prev_lon, prev_alt, lat, lon, alt)
         seg_2d = haversine_distance(prev_lat, prev_lon, lat, lon)
         cumulative_arc += seg_2d
         total_dist     += seg_3d
 
-        # Speed along segment depends on phase
-        if phase in (FlightPhase.CLIMB, FlightPhase.TERMINAL) and alt > prev_alt:
-            # Vertical component dominates — use 3D distance at climb rate
-            vert_dist = alt - prev_alt
-            seg_time  = vert_dist / climb_rate
-        elif phase in (FlightPhase.DESCENT, FlightPhase.TERMINAL) and alt < prev_alt:
-            vert_dist = prev_alt - alt
-            seg_time  = vert_dist / descent_rate
-        elif phase == FlightPhase.GROUND:
-            seg_time = 0.5   # brief ground pause
-        else:
-            seg_time = seg_3d / cruise_speed
-
-        current_time += seg_time
-        sigma = _compute_sigma_t(cumulative_arc)
+        # ── Heading ───────────────────────────────────────────────────────────
         heading = calculate_heading(prev_lat, prev_lon, lat, lon)
 
-        speed = (climb_rate   if (phase == FlightPhase.CLIMB and alt > prev_alt)
-                 else descent_rate if (phase == FlightPhase.DESCENT and alt < prev_alt)
-                 else cruise_speed)
+        # ── Speed (phase-aware; CRUISE slows on turns) ────────────────────────
+        if phase == FlightPhase.CLIMB and alt > prev_alt:
+            speed = climb_rate
+        elif phase == FlightPhase.DESCENT and alt < prev_alt:
+            speed = descent_rate
+        elif phase == FlightPhase.GROUND:
+            speed = 0.0
+        elif phase == FlightPhase.CRUISE:
+            prev_heading = waypoints4d[-1].heading if waypoints4d else heading
+            speed = _turn_speed(
+                prev_heading, heading,
+                cruise_speed, config.DRONE_MIN_SPEED
+            )
+        else:
+            speed = cruise_speed   # TERMINAL
+
+        # ── Segment travel time ───────────────────────────────────────────────
+        if phase in (FlightPhase.CLIMB, FlightPhase.TERMINAL) and alt > prev_alt:
+            seg_time = (alt - prev_alt) / climb_rate
+        elif phase in (FlightPhase.DESCENT, FlightPhase.TERMINAL) and alt < prev_alt:
+            seg_time = (prev_alt - alt) / descent_rate
+        elif phase == FlightPhase.GROUND:
+            seg_time = 0.5
+        else:
+            seg_time = seg_3d / speed   # turn-adjusted for CRUISE
+
+        current_time += seg_time
+        sigma         = _compute_sigma_t(cumulative_arc)
 
         wp_xyz   = anchor_registry._to_xyz(lat, lon, min(alt, 130.0))
         bindings, _, _ = anchor_registry.compute_anchor_bindings(wp_xyz)
@@ -525,6 +738,7 @@ def build_4d_trajectory(latlon_path: List[LatLon],
             sigma_t=sigma,
             anchor_bindings=bindings,
         ))
+
         prev_lat, prev_lon, prev_alt = lat, lon, alt
 
     waypoints4d[-1].speed = 0.0
@@ -549,10 +763,7 @@ def build_4d_trajectory(latlon_path: List[LatLon],
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_direct_path(start: Position, goal: Position) -> List[LatLon]:
-    """
-    Return the straight line between start and goal.
-    Road-unaware and zone-unaware — used only for reroute animation.
-    """
+    """Straight line between start and goal — used only for reroute animation."""
     return [(start.latitude, start.longitude),
             (goal.latitude,  goal.longitude)]
 
@@ -566,18 +777,20 @@ def plan_trajectory(start: Position, goal: Position,
                     stratum: Optional[int] = None,
                     direction: Optional[str] = None) -> Optional[Trajectory4D]:
     """
-    Plan a road-following, obstacle-aware 4-D trajectory.
+    Plan a road-following, obstacle-aware, time-optimal 4-D trajectory.
 
-    If stratum/direction are None, they are computed from the overall heading.
-    Returns Trajectory4D (with climb/descent, sigma_t, phase tags),
-    or None if no valid path could be found.
+    Level 1: Direct OSRM route (validated against no-fly zones)
+    Level 2: Yen's K=5 bypass corners snapped to roads, chained OSRM route
+    Level 3: Pure Yen's K=5 visibility graph (no road guarantee)
+
+    Stratum and direction are derived from overall heading if not provided.
     """
     print(f"[Pathfinding] ({start.latitude:.4f},{start.longitude:.4f}) -> "
           f"({goal.latitude:.4f},{goal.longitude:.4f})")
 
     latlon_path: Optional[List[LatLon]] = None
 
-    # ── Level 1: Direct OSRM ─────────────────────────────────
+    # ── Level 1: Direct OSRM ──────────────────────────────────────────────────
     road_points = fetch_osrm_route(start, goal)
 
     if road_points and not _path_hits_no_fly_zone(road_points):
@@ -614,14 +827,14 @@ def plan_trajectory(start: Position, goal: Position,
                     latlon_path = chained
 
         if latlon_path is None:
-            print("[Pathfinding] Level 3: Visibility Graph A*")
+            print("[Pathfinding] Level 3: Yen's K=5 visibility graph")
             latlon_path = visibility_graph_astar(
                 (start.latitude, start.longitude),
                 (goal.latitude,  goal.longitude)
             )
 
     else:
-        print("[Pathfinding] OSRM unavailable — Level 3 A*")
+        print("[Pathfinding] OSRM unavailable — Level 3 Yen's K=5")
         latlon_path = visibility_graph_astar(
             (start.latitude, start.longitude),
             (goal.latitude,  goal.longitude)

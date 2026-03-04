@@ -106,6 +106,39 @@
                 Launch All Reroute Demos
             </button>
         </div>
+        <div class="panel-section">
+            <div class="section-title">⚡ Conflict Demos</div>
+            <div class="reroute-hint">
+                Two drones launched simultaneously — watch the header for
+                <strong style="color:#f59e0b">Altitude Change</strong> or
+                <strong style="color:#ef4444">Takeoff Delay</strong> alerts.
+            </div>
+            <div class="demo-scenarios">
+                <button class="demo-btn conflict-btn" onclick="loadConflictScenario(12)">
+                    <span class="demo-btn-label">Downtown ↔ Mission</span>
+                    <span class="demo-btn-badge altitude">↕ Altitude</span>
+                </button>
+                <button class="demo-btn conflict-btn" onclick="loadConflictScenario(13)">
+                    <span class="demo-btn-label">NorthBeach ↔ Castro</span>
+                    <span class="demo-btn-badge altitude">↕ Altitude</span>
+                </button>
+                <button class="demo-btn conflict-btn" onclick="loadConflictScenario(14)">
+                    <span class="demo-btn-label">Marina → Potrero ×2</span>
+                    <span class="demo-btn-badge delay">⏱ Delay</span>
+                </button>
+                <button class="demo-btn conflict-btn" onclick="loadConflictScenario(15)">
+                    <span class="demo-btn-label">GGPark→TransBay ✕ Marina→Glen</span>
+                    <span class="demo-btn-badge altitude">↕ Altitude</span>
+                </button>
+                <button class="demo-btn conflict-btn" onclick="loadConflictScenario(16)">
+                    <span class="demo-btn-label">Sunset ↔ Potrero E–W</span>
+                    <span class="demo-btn-badge altitude">↕ Altitude</span>
+                </button>
+            </div>
+            <button class="btn btn-conflict" onclick="loadAllConflictScenarios()" style="margin-top:10px;">
+                Launch All Conflict Demos
+            </button>
+        </div>
         
         <div class="panel-section">
             <div class="section-title">📦 Custom Delivery</div>

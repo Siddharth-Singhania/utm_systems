@@ -16,22 +16,71 @@ const MIN_ALTITUDE = 20.0;
 let INFRASTRUCTURE_NODES = {};
 
 const DEMO_SCENARIOS = {
-    // ── Standard routes (no no-fly zone conflict, all on land) ──
-    1: { label: "Downtown → W.Portal",           distance: "~9km",  pickup: { lat: 37.7749, lon: -122.4194 }, delivery: { lat: 37.6879, lon: -122.4702 } },
-    2: { label: "Marina → Inner Richmond",        distance: "~4km",  pickup: { lat: 37.8055, lon: -122.4367 }, delivery: { lat: 37.7946, lon: -122.3999 } },
-    3: { label: "Mission → North Beach",          distance: "~6km",  pickup: { lat: 37.7599, lon: -122.4148 }, delivery: { lat: 37.8009, lon: -122.4103 } },
-    4: { label: "GG Park → North Beach",          distance: "~10km", pickup: { lat: 37.7694, lon: -122.4862 }, delivery: { lat: 37.7955, lon: -122.3937 } },
-    5: { label: "Castro → Fishermans Wharf",      distance: "~7km",  pickup: { lat: 37.7609, lon: -122.4350 }, delivery: { lat: 37.8080, lon: -122.4177 } },
-    // ── Reroute scenarios (straight-line path crosses a no-fly zone, all on land) ──
-    // Pickup and delivery are on land. Straight line between them cuts through a zone.
-    // Animation: red dashed line shows blocked path, then A* reroutes around it on roads.
-    6: { label: "SFO North → Brisbane",          distance: "~9km",  reroute: true, zone: "Airport",  pickup: { lat: 37.6600, lon: -122.3700 }, delivery: { lat: 37.5800, lon: -122.3700 } },
-    7: { label: "Noe Valley → San Bruno",         distance: "~11km", reroute: true, zone: "Airport",  pickup: { lat: 37.6400, lon: -122.4200 }, delivery: { lat: 37.5800, lon: -122.3550 } },
-    8: { label: "Inner Richmond → Outer Sunset",  distance: "~6km",  reroute: true, zone: "Presidio", pickup: { lat: 37.8000, lon: -122.4400 }, delivery: { lat: 37.7750, lon: -122.5030 } },
-    9: { label: "Westlake → Bayshore",           distance: "~7km",  reroute: true, zone: "Airport",  pickup: { lat: 37.6050, lon: -122.4200 }, delivery: { lat: 37.6050, lon: -122.3400 } },
-   10: { label: "South SF → Daly City",          distance: "~6km",  reroute: true, zone: "Airport",  pickup: { lat: 37.5900, lon: -122.3700 }, delivery: { lat: 37.6400, lon: -122.3700 } },
-   11: { label: "Pacific Heights → Outer Sunset", distance: "~9km",  reroute: true, zone: "Presidio", pickup: { lat: 37.8050, lon: -122.4300 }, delivery: { lat: 37.7600, lon: -122.5050 } },
+    // ── Standard routes ───────────────────────────────────────────────────────
+    1:  { label: "Downtown → W.Portal",           distance: "~9km",  pickup: { lat: 37.7749, lon: -122.4194 }, delivery: { lat: 37.6879, lon: -122.4702 } },
+    2:  { label: "Marina → Inner Richmond",        distance: "~4km",  pickup: { lat: 37.8055, lon: -122.4367 }, delivery: { lat: 37.7946, lon: -122.3999 } },
+    3:  { label: "Mission → North Beach",          distance: "~6km",  pickup: { lat: 37.7599, lon: -122.4148 }, delivery: { lat: 37.8009, lon: -122.4103 } },
+    4:  { label: "GG Park → North Beach",          distance: "~10km", pickup: { lat: 37.7694, lon: -122.4862 }, delivery: { lat: 37.7955, lon: -122.3937 } },
+    5:  { label: "Castro → Fishermans Wharf",      distance: "~7km",  pickup: { lat: 37.7609, lon: -122.4350 }, delivery: { lat: 37.8080, lon: -122.4177 } },
+
+    // ── Reroute demos (straight-line crosses a no-fly zone) ───────────────────
+    6:  { label: "SFO North → Brisbane",           distance: "~9km",  reroute: true, zone: "Airport",  pickup: { lat: 37.6600, lon: -122.3700 }, delivery: { lat: 37.5800, lon: -122.3700 } },
+    7:  { label: "Noe Valley → San Bruno",         distance: "~11km", reroute: true, zone: "Airport",  pickup: { lat: 37.6400, lon: -122.4200 }, delivery: { lat: 37.5800, lon: -122.3550 } },
+    8:  { label: "Inner Richmond → Outer Sunset",  distance: "~6km",  reroute: true, zone: "Presidio", pickup: { lat: 37.8000, lon: -122.4400 }, delivery: { lat: 37.7750, lon: -122.5030 } },
+    9:  { label: "Westlake → Bayshore",            distance: "~7km",  reroute: true, zone: "Airport",  pickup: { lat: 37.6050, lon: -122.4200 }, delivery: { lat: 37.6050, lon: -122.3400 } },
+    10: { label: "South SF → Daly City",           distance: "~6km",  reroute: true, zone: "Airport",  pickup: { lat: 37.5900, lon: -122.3700 }, delivery: { lat: 37.6400, lon: -122.3700 } },
+    11: { label: "Pacific Heights → Outer Sunset", distance: "~9km",  reroute: true, zone: "Presidio", pickup: { lat: 37.8050, lon: -122.4300 }, delivery: { lat: 37.7600, lon: -122.5050 } },
+
+    // ── Conflict demos ────────────────────────────────────────────────────────
+    // Each entry is a PAIR launched back-to-back (<600 ms apart).
+    // Expected resolution is noted so the operator knows what to look for.
+    // Launch both legs of a pair via loadConflictScenario(id).
+
+    // 12a/12b — Counter-flow: same corridor, opposite directions.
+    // NORTH drone is assigned stratum 60 m, SOUTH drone 40 m.
+    // With pad queue off both launch simultaneously → their 4D paths overlap
+    // in the cruise segment → resolver switches one to the next free stratum.
+    // Expected: ALTITUDE CHANGE alert (e.g. 60 m → 80 m).
+    12: { label: "Downtown ↔ Mission (counter-flow)", conflict: "altitude", pair: [
+        { pickup: { lat: 37.7749, lon: -122.4194 }, delivery: { lat: 37.7599, lon: -122.4148 } },
+        { pickup: { lat: 37.7599, lon: -122.4148 }, delivery: { lat: 37.7749, lon: -122.4194 } },
+    ]},
+
+    // 13a/13b — Counter-flow: longer north–south corridor.
+    // Expected: ALTITUDE CHANGE alert.
+    13: { label: "NorthBeach ↔ Castro (counter-flow)", conflict: "altitude", pair: [
+        { pickup: { lat: 37.8009, lon: -122.4103 }, delivery: { lat: 37.7609, lon: -122.4350 } },
+        { pickup: { lat: 37.7609, lon: -122.4350 }, delivery: { lat: 37.8009, lon: -122.4103 } },
+    ]},
+
+    // 14a/14b — Same route, same direction, rapid succession.
+    // Both drones follow identical road paths → CPA detects head-on overlap
+    // in time even though directions match.
+    // Expected: TAKEOFF DELAY alert (binary-search delay applied to drone 2).
+    14: { label: "Marina → Potrero (same path ×2)", conflict: "delay", pair: [
+        { pickup: { lat: 37.8055, lon: -122.4367 }, delivery: { lat: 37.7560, lon: -122.4000 } },
+        { pickup: { lat: 37.8055, lon: -122.4367 }, delivery: { lat: 37.7560, lon: -122.4000 } },
+    ]},
+
+    // 15a/15b — Intersecting diagonals.
+    // SW→NE crosses NW→SE roughly over the Civic Center area.
+    // Expected: ALTITUDE CHANGE alert (different strata assigned to each diagonal).
+    15: { label: "GGPark → TransBay ✕ Marina → GlenPark (crossing)", conflict: "altitude", pair: [
+        { pickup: { lat: 37.7694, lon: -122.4862 }, delivery: { lat: 37.7895, lon: -122.3969 } },
+        { pickup: { lat: 37.8055, lon: -122.4367 }, delivery: { lat: 37.7329, lon: -122.4337 } },
+    ]},
+
+    // 16a/16b — East–West counter-flow.
+    // EAST drone stratum 50 m, WEST drone stratum 30 m (20 m gap).
+    // Overlap forces resolver to switch one to 70 m or apply delay.
+    // Expected: ALTITUDE CHANGE or TAKEOFF DELAY alert.
+    16: { label: "Sunset ↔ Potrero (E–W counter-flow)", conflict: "altitude", pair: [
+        { pickup: { lat: 37.7560, lon: -122.4862 }, delivery: { lat: 37.7560, lon: -122.4000 } },
+        { pickup: { lat: 37.7560, lon: -122.4000 }, delivery: { lat: 37.7560, lon: -122.4862 } },
+    ]},
 };
+
+
 
 // ── Cesium ───────────────────────────────────────────────────
 Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI1ZWQ4NmZjZS1hMGVkLTQzNjYtYTIwZi1kYWFmMDM2NmYzZTIiLCJpZCI6MzkwMDE1LCJpYXQiOjE3NzA5MDQ5MTJ9.oMikqljPMbCSIgEWEdCwZZnJyFDDLDU4RUYYpUrXxMI';
@@ -564,6 +613,38 @@ function _redrawAllRangingLines() {
             shouldShow
         );
     });
+}
+
+/**
+ * Launch both legs of a conflict demo pair with a short gap between them.
+ * The gap (200 ms) is intentionally small so both 4D trajectories are
+ * registered before the second one's CPA check runs — guaranteeing overlap.
+ */
+async function loadConflictScenario(id) {
+    const s = DEMO_SCENARIOS[id];
+    if (!s || !s.pair) return;
+
+    for (const leg of s.pair) {
+        await fetch(`${API_URL}/api/delivery/request`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                pickup:   { latitude: leg.pickup.lat,   longitude: leg.pickup.lon,   altitude: MIN_ALTITUDE },
+                delivery: { latitude: leg.delivery.lat, longitude: leg.delivery.lon, altitude: MIN_ALTITUDE },
+            })
+        }).catch(e => console.error(`Conflict scenario ${id} leg failed:`, e));
+
+        // Short gap — enough for the first mission to be stored in flight_plans_4d
+        // before the second request's CPA check runs against it.
+        await new Promise(r => setTimeout(r, 200));
+    }
+}
+
+async function loadAllConflictScenarios() {
+    for (const id of [12, 13, 14, 15, 16]) {
+        await loadConflictScenario(id);
+        await new Promise(r => setTimeout(r, 1000));  // gap between pairs
+    }
 }
 
 

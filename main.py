@@ -561,41 +561,46 @@ async def create_delivery(request: DeliveryRequest):
           f"  | ETA {traj4d.total_time / 60:.1f} min"
           + ("  | REROUTED" if was_rerouted else ""))
 
-    # ── Step 4: Pad queue — takeoff + landing slots ───────────────────────────
+    # ── Step 4: Pad queue (conditionally bypassed) ────────────────────────────
     pickup_lat   = request.pickup.latitude
     pickup_lon   = request.pickup.longitude
     delivery_lat = request.delivery.latitude
     delivery_lon = request.delivery.longitude
 
-    # Takeoff: push to earliest free slot on pickup pad
-    earliest_takeoff = conflict_detection.pad_queue.earliest_available(
-        pickup_lat, pickup_lon, not_before=time.time()
-    )
-    pad_delay = max(0.0, earliest_takeoff - time.time())
-    if pad_delay > 0.0:
-        print(f"[{mission_id}] Pickup pad busy — delaying +{pad_delay:.1f}s")
-        traj4d = conflict_detection.apply_delay(traj4d, pad_delay)
+    if conflict_detection.PAD_QUEUE_ENABLED:
+        # Original FIFO pad logic — enforces sequential pad use
+        earliest_takeoff = conflict_detection.pad_queue.earliest_available(
+            pickup_lat, pickup_lon, not_before=time.time()
+        )
+        pad_delay = max(0.0, earliest_takeoff - time.time())
+        if pad_delay > 0.0:
+            print(f"[{mission_id}] Pickup pad busy — delaying +{pad_delay:.1f}s")
+            traj4d = conflict_detection.apply_delay(traj4d, pad_delay)
 
-    # Landing: check delivery pad availability
-    landing_eta   = traj4d.waypoints[-1].eta
-    landing_start = landing_eta - config.PAD_CLEARANCE_TIME
-    earliest_land = conflict_detection.pad_queue.earliest_available(
-        delivery_lat, delivery_lon, not_before=landing_start
-    )
-    if earliest_land > landing_start:
-        extra = earliest_land - landing_start
-        print(f"[{mission_id}] Delivery pad busy — delaying +{extra:.1f}s")
-        traj4d       = conflict_detection.apply_delay(traj4d, extra)
-        landing_eta  = traj4d.waypoints[-1].eta
+        landing_eta   = traj4d.waypoints[-1].eta
         landing_start = landing_eta - config.PAD_CLEARANCE_TIME
+        earliest_land = conflict_detection.pad_queue.earliest_available(
+            delivery_lat, delivery_lon, not_before=landing_start
+        )
+        if earliest_land > landing_start:
+            extra = earliest_land - landing_start
+            print(f"[{mission_id}] Delivery pad busy — delaying +{extra:.1f}s")
+            traj4d       = conflict_detection.apply_delay(traj4d, extra)
+            landing_eta  = traj4d.waypoints[-1].eta
+            landing_start = landing_eta - config.PAD_CLEARANCE_TIME
 
-    # Tentative reservations (will be refreshed after CPA in step 6)
-    takeoff_start = traj4d.waypoints[0].eta
-    takeoff_end   = takeoff_start + config.PAD_CLEARANCE_TIME
-    conflict_detection.pad_queue.reserve(
-        drone_id, pickup_lat, pickup_lon, takeoff_start, takeoff_end)
-    conflict_detection.pad_queue.reserve(
-        drone_id, delivery_lat, delivery_lon, landing_start, landing_eta)
+        takeoff_start = traj4d.waypoints[0].eta
+        takeoff_end   = takeoff_start + config.PAD_CLEARANCE_TIME
+        conflict_detection.pad_queue.reserve(
+            drone_id, pickup_lat, pickup_lon, takeoff_start, takeoff_end)
+        conflict_detection.pad_queue.reserve(
+            drone_id, delivery_lat, delivery_lon, landing_start, landing_eta)
+    else:
+        # Pad queue bypassed — all drones launch immediately.
+        # CPA conflict resolution (Step 5) still runs and will detect
+        # mid-air 4D overlaps, triggering altitude strata changes or
+        # takeoff delays as needed.
+        print(f"[{mission_id}] Pad queue bypassed — immediate launch")
 
     # ── Step 5: CPA conflict cascade (altitude → delay) ───────────────────────
     alert: Optional[ConflictAlert] = None
@@ -635,23 +640,21 @@ async def create_delivery(request: DeliveryRequest):
                 "conflicts":   exc.conflicts,
             },
         )
+    # ── Step 6: Re-reserve pad slots with final ETAs ──────────────────────────
+    if conflict_detection.PAD_QUEUE_ENABLED:
+        conflict_detection.pad_queue.release(drone_id)
 
-    # ── Step 6: Re-reserve pad slots with final (post-CPA) ETAs ─────────────
-    # The CPA resolver may have changed ETAs via a takeoff delay.
-    # Release the tentative slots and book the correct times.
-    conflict_detection.pad_queue.release(drone_id)
+        final_takeoff_start = traj4d.waypoints[0].eta
+        final_takeoff_end   = final_takeoff_start + config.PAD_CLEARANCE_TIME
+        final_landing_eta   = traj4d.waypoints[-1].eta
+        final_landing_start = final_landing_eta - config.PAD_CLEARANCE_TIME
 
-    final_takeoff_start = traj4d.waypoints[0].eta
-    final_takeoff_end   = final_takeoff_start + config.PAD_CLEARANCE_TIME
-    final_landing_eta   = traj4d.waypoints[-1].eta
-    final_landing_start = final_landing_eta - config.PAD_CLEARANCE_TIME
-
-    conflict_detection.pad_queue.reserve(
-        drone_id, pickup_lat, pickup_lon,
-        final_takeoff_start, final_takeoff_end)
-    conflict_detection.pad_queue.reserve(
-        drone_id, delivery_lat, delivery_lon,
-        final_landing_start, final_landing_eta)
+        conflict_detection.pad_queue.reserve(
+            drone_id, pickup_lat, pickup_lon,
+            final_takeoff_start, final_takeoff_end)
+        conflict_detection.pad_queue.reserve(
+            drone_id, delivery_lat, delivery_lon,
+            final_landing_start, final_landing_eta)
 
     # ── Step 7: Build mission ─────────────────────────────────────────────────
     # Convert 4-D trajectory to the legacy format the frontend expects.
