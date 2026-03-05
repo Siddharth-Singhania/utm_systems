@@ -1,701 +1,702 @@
 """
-4-D Trajectory-Based Conflict Resolution
-=========================================
+ConflictResolver — Planning-time 4-D conflict detection and resolution
 
-Architecture
-------------
-All conflict resolution happens at PLANNING TIME, before the drone launches.
-Adjustments are baked into the Trajectory4D before it is broadcast.
+Overview
+--------
+Every newly planned trajectory is checked against all currently active
+trajectories using continuous Closest-Point-of-Approach (CPA) math before the
+drone is committed to the plan.  If a conflict is found, the resolver applies
+two resolution layers in order:
 
-Three protection layers, applied in order:
-  Layer 0 - Structural (direction-exclusive altitude strata)
-             Free separation, handled in pathfinding.py before this module.
-  Layer 1 - Vertical separation (switch to a different stratum)
-  Layer 2 - Temporal separation (uniform takeoff delay)
+  Layer 1  — Altitude (Stratum) Reassignment
+    Try every stratum in config.ALL_STRATA_ORDERED for the lower-priority
+    drone.  Accept the first stratum that is conflict-free.
 
-Conflict detection uses CONTINUOUS CLOSEST-POINT-OF-APPROACH (CPA) math
-on every pair of trajectory segments whose time windows overlap.
-This eliminates the blind spots of discrete time-sampling.
+  Layer 2  — Path vs. Speed Trade-off  (runs only if Layer 1 exhausted)
+    Option A: Keep the primary path; binary-search for the minimum cruise
+              speed V_reduced ∈ [DRONE_MIN_SPEED, V_cruise] that resolves all
+              conflicts.  Compute final ETA including kinematic turn penalties
+              at V_reduced (corners are slower at reduced cruise speed).
 
-The effective protection radius expands with timing uncertainty (sigma_t):
-    R_eff(wp) = R_BASE + speed * sigma_t(wp)
+    Option B: Test each Yen's alternative trajectory (paths 2-5, pre-built by
+              plan_trajectory at full speed V_cruise) against all active
+              drones.  Find the fastest conflict-free alternative.
 
-Terminal areas (r < TERMINAL_RADIUS from a pad, alt < TERMINAL_HEIGHT) use
-a FIFO pad queue rather than CPA checks.
+    Selection: compare final ETA of Option A vs. Option B.  Accept whichever
+               drone lands first.  If neither option succeeds, fall back to a
+               binary-searched takeoff delay on the primary trajectory (the
+               original behaviour).
+
+CPA Model (Analytic Quadratic)
+-------------------------------
+Two drones A and B are modelled as moving linearly between consecutive
+waypoints.  For overlapping time windows [t_lo, t_hi]:
+
+    d(s) = D₀ + s · Dv          s ∈ [0, Δt],  Δt = t_hi − t_lo
+    D₀   = Pa(t_lo) − Pb(t_lo)  (initial separation vector)
+    Dv   = Va − Vb               (relative velocity vector in lat/lon/alt)
+
+    |d(s)|² = |Dv|² s² + 2(D₀·Dv) s + |D₀|²
+
+    t_cpa = −(D₀·Dv) / |Dv|²   → clamp to [0, Δt]
+    d_cpa = |d(t_cpa)|
+
+Conflict when:
+    d_cpa_horizontal  <  R_eff   (metres, haversine-equivalent)
+    d_cpa_vertical    <  V_sep   (metres, absolute altitude difference)
+
+where  R_eff = DRONE_PROTECTION_RADIUS + CPA_SIGMA_SCALE × (σ_t_A + σ_t_B)
+expands the protected cylinder proportionally to the combined timing
+uncertainty of the two waypoints.
+
+Priority Rule
+-------------
+Lower drone_id (lexicographic / insertion order) = higher priority.
+Higher-priority drones are never modified; only the lower-priority drone's
+trajectory is adjusted.
 """
 
+from __future__ import annotations
+
 import math
-import time
 from typing import Dict, List, Optional, Tuple
-from models import (
-    Position, ConflictAlert, Trajectory4D, Waypoint4D, FlightPhase
-)
+
+from models import Position, Waypoint4D, Trajectory4D, FlightPhase
 import config
-import uuid
-
-import anchors as anchor_registry
-# ── Type aliases ──────────────────────────────────────────────────────────────
-Vec3 = Tuple[float, float, float]   # (lat_m, lon_m, alt_m) in metres
-PAD_QUEUE_ENABLED = False
-
-# ── Coordinate helpers ────────────────────────────────────────────────────────
-_LAT_M  = 111_319.5   # metres per degree of latitude
-_LON_M  = 111_319.5   # metres per degree of longitude at equator
-
-
-def _to_metres(lat: float, lon: float, alt: float,
-               ref_lat: float = 37.75) -> Vec3:
-    """Convert (lat, lon, alt) to a local Cartesian metric frame.
-    Uses a flat-earth projection centred at ref_lat.
-    Accurate to < 0.1 % over the SF operational area (~40 km).
-    """
-    x = (lat - ref_lat) * _LAT_M
-    y = (lon - (-122.42)) * _LON_M * math.cos(math.radians(ref_lat))
-    z = alt
-    return (x, y, z)
-
-
-def _dist3(a: Vec3, b: Vec3) -> float:
-    return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2)
-
-
-def _dist2(a: Vec3, b: Vec3) -> float:
-    """Horizontal-only distance (ignores z)."""
-    return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2)
+import pathfinding
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAD QUEUE  (Terminal Area FIFO)
+# CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-class PadQueue:
-    """
-    FIFO time-slot queue for each launch/landing pad.
+# How many seconds of temporal buffer to verify that a proposed resolution
+# truly separates the two drones — checked on the full trajectory.
+_CPA_CHECK_BUFFER: float = 0.0
 
-    Pad identity is a rounded (lat, lon) key (1-decimal-place precision,
-    ~10 km grid) — pads within ~5 km are treated as the same pad for
-    terminal-area conflict purposes.
-    """
-    # Coarser rounding for pad identity
-    _ROUND = 2   # 2 decimal places ≈ 1.1 km grid
+# How many binary-search iterations for speed reduction (Option A).
+_SPEED_BISECT_ITERS: int = 20
 
-    def __init__(self) -> None:
-        # pad_key -> list of (drone_id, window_start, window_end) sorted by window_start
-        self._slots: Dict[str, List[Tuple[str, float, float]]] = {}
+# How many binary-search iterations for takeoff-delay fallback.
+_DELAY_BISECT_ITERS: int = 24
 
-    @staticmethod
-    def _key(lat: float, lon: float) -> str:
-        return f"{round(lat, PadQueue._ROUND)},{round(lon, PadQueue._ROUND)}"
+# Scale factor for sigma_t expansion of the protection radius.
+# R_eff = PROTECTION_RADIUS + CPA_SIGMA_SCALE × (σ_t_a + σ_t_b)
+_CPA_SIGMA_SCALE: float = getattr(config, 'CPA_SIGMA_SCALE', 1.0)
 
-    def earliest_available(self, lat: float, lon: float,
-                           not_before: float) -> float:
-        """
-        Return the earliest time >= not_before at which the pad is free.
-        Accounts for PAD_CLEARANCE_TIME between consecutive users.
-        """
-        key = self._key(lat, lon)
-        slots = self._slots.get(key, [])
-        candidate = not_before
-        for _, w_start, w_end in slots:
-            # If candidate overlaps this slot, push past it
-            if candidate < w_end + config.PAD_CLEARANCE_TIME:
-                if w_end + config.PAD_CLEARANCE_TIME > candidate:
-                    candidate = w_end + config.PAD_CLEARANCE_TIME
-        return candidate
-
-    def reserve(self, drone_id: str, lat: float, lon: float,
-                window_start: float, window_end: float) -> None:
-        key = self._key(lat, lon)
-        if key not in self._slots:
-            self._slots[key] = []
-        self._slots[key].append((drone_id, window_start, window_end))
-        self._slots[key].sort(key=lambda x: x[1])
-
-    def release(self, drone_id: str) -> None:
-        """Remove all slots belonging to drone_id (called on mission cleanup)."""
-        for key in self._slots:
-            self._slots[key] = [
-                s for s in self._slots[key] if s[0] != drone_id
-            ]
-
-
-# Singleton pad queue (shared across requests)
-pad_queue = PadQueue()
+# Resolution labels returned in the info string.
+_RES_STRATUM   = 'LAYER1_STRATUM'
+_RES_SPEED     = 'LAYER2_SPEED'
+_RES_ALT_PATH  = 'LAYER2_ALT_PATH'
+_RES_DELAY     = 'FALLBACK_DELAY'
+_RES_NONE      = 'UNRESOLVED'
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONTINUOUS CPA  (Closest Point of Approach)
+# LOW-LEVEL CPA GEOMETRY
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _segment_cpa(
-    a0: Vec3, a1: Vec3, ta0: float, ta1: float,   # drone A segment
-    b0: Vec3, b1: Vec3, tb0: float, tb1: float,   # drone B segment
-) -> Tuple[float, float, float, float]:
+def _lat_lon_to_xy_local(lat: float, lon: float,
+                          ref_lat: float, ref_lon: float) -> Tuple[float, float]:
     """
-    Compute the minimum 3-D distance between two moving points over their
-    shared time interval, using analytic closest-point-of-approach.
+    Convert (lat, lon) to approximate Cartesian metres relative to a
+    reference point.  Accurate to ~0.1 % within 10 km — sufficient for CPA.
+    """
+    R = 6_371_000.0
+    x = math.radians(lon - ref_lon) * R * math.cos(math.radians(ref_lat))
+    y = math.radians(lat - ref_lat) * R
+    return x, y
 
-    Both drones move linearly within their segment:
-        A(t) = a0 + (t - ta0) / (ta1 - ta0) * (a1 - a0)
-        B(t) = b0 + (t - tb0) / (tb1 - tb0) * (b1 - b0)
 
-    The relative velocity is constant, so ||A(t) - B(t)||^2 is a quadratic
-    in t.  We minimise analytically and clamp to the shared time window.
+def _wp_xyz(wp: Waypoint4D,
+             ref_lat: float, ref_lon: float) -> Tuple[float, float, float]:
+    x, y = _lat_lon_to_xy_local(
+        wp.position.latitude, wp.position.longitude, ref_lat, ref_lon
+    )
+    return x, y, wp.position.altitude
 
-    Returns (min_3d_dist, min_horiz_dist, min_vert_dist, cpa_time).
+
+def _cpa_segment_pair(
+    ax0: float, ay0: float, az0: float,
+    ax1: float, ay1: float, az1: float,
+    bx0: float, by0: float, bz0: float,
+    bx1: float, by1: float, bz1: float,
+    ta0: float, ta1: float,
+    tb0: float, tb1: float,
+    r_eff: float,
+    v_sep: float,
+) -> bool:
+    """
+    Check whether two linear trajectory segments conflict.
+
+    Each drone moves at constant velocity between two 3-D positions over its
+    own time interval.  The function finds the time of minimum separation
+    within the overlapping portion of those intervals.
+
+    Returns True if a conflict (violation of protected airspace) is found.
     """
     t_lo = max(ta0, tb0)
     t_hi = min(ta1, tb1)
-    if t_lo >= t_hi:
-        return float('inf'), float('inf'), float('inf'), t_lo
+    if t_hi <= t_lo:
+        return False               # no temporal overlap
 
-    dt_a = ta1 - ta0 if ta1 != ta0 else 1e-9
-    dt_b = tb1 - tb0 if tb1 != tb0 else 1e-9
+    # Fraction of each drone's segment occupied by the overlap window
+    da = ta1 - ta0
+    db = tb1 - tb0
+    if da < 1e-9 or db < 1e-9:
+        return False
 
-    # Velocity vectors (metres/second in local frame)
-    va = ((a1[0]-a0[0])/dt_a, (a1[1]-a0[1])/dt_a, (a1[2]-a0[2])/dt_a)
-    vb = ((b1[0]-b0[0])/dt_b, (b1[1]-b0[1])/dt_b, (b1[2]-b0[2])/dt_b)
+    fa0 = (t_lo - ta0) / da
+    fa1 = (t_hi - ta0) / da
+    fb0 = (t_lo - tb0) / db
+    fb1 = (t_hi - tb0) / db
 
-    # Relative position at t=t_lo
-    pa = (a0[0] + va[0]*(t_lo-ta0),
-          a0[1] + va[1]*(t_lo-ta0),
-          a0[2] + va[2]*(t_lo-ta0))
-    pb = (b0[0] + vb[0]*(t_lo-tb0),
-          b0[1] + vb[1]*(t_lo-tb0),
-          b0[2] + vb[2]*(t_lo-tb0))
+    # 3-D positions at the start of the overlap window
+    Pa = (ax0 + fa0 * (ax1 - ax0),
+          ay0 + fa0 * (ay1 - ay0),
+          az0 + fa0 * (az1 - az0))
+    Qa = (ax0 + fa1 * (ax1 - ax0),
+          ay0 + fa1 * (ay1 - ay0),
+          az0 + fa1 * (az1 - az0))
 
-    r0  = (pa[0]-pb[0], pa[1]-pb[1], pa[2]-pb[2])
-    vr  = (va[0]-vb[0], va[1]-vb[1], va[2]-vb[2])
+    Pb = (bx0 + fb0 * (bx1 - bx0),
+          by0 + fb0 * (by1 - by0),
+          bz0 + fb0 * (bz1 - bz0))
+    Qb = (bx0 + fb1 * (bx1 - bx0),
+          by0 + fb1 * (by1 - by0),
+          bz0 + fb1 * (bz1 - bz0))
 
-    # d²(t) = |r0 + vr*(t-t_lo)|² = a*s² + b*s + c  where s = t-t_lo
-    a_coef = vr[0]**2 + vr[1]**2 + vr[2]**2
-    b_coef = 2*(r0[0]*vr[0] + r0[1]*vr[1] + r0[2]*vr[2])
+    dt = t_hi - t_lo
 
-    duration = t_hi - t_lo
+    # Velocity vectors during the overlap
+    Vax = (Qa[0] - Pa[0]) / dt;  Vay = (Qa[1] - Pa[1]) / dt
+    Vaz = (Qa[2] - Pa[2]) / dt
+    Vbx = (Qb[0] - Pb[0]) / dt;  Vby = (Qb[1] - Pb[1]) / dt
+    Vbz = (Qb[2] - Pb[2]) / dt
 
-    if a_coef < 1e-12:
-        # Parallel / stationary relative motion — distance constant
-        t_cpa = t_lo
+    # Relative motion: d(s) = D0 + s * Dv
+    D0x = Pa[0] - Pb[0];  D0y = Pa[1] - Pb[1];  D0z = Pa[2] - Pb[2]
+    Dvx = Vax - Vbx;      Dvy = Vay - Vby;      Dvz = Vaz - Vbz
+
+    Dv2 = Dvx*Dvx + Dvy*Dvy + Dvz*Dvz
+    if Dv2 < 1e-12:
+        # Drones stationary relative to each other — check initial separation
+        t_cpa_s = 0.0
     else:
-        s_min = -b_coef / (2 * a_coef)
-        s_min = max(0.0, min(s_min, duration))
-        t_cpa = t_lo + s_min
+        # t_cpa = −(D0 · Dv) / |Dv|²    (unclamped)
+        dot = D0x*Dvx + D0y*Dvy + D0z*Dvz
+        t_cpa_s = max(0.0, min(dt, -dot / Dv2))
 
-    # Positions at t_cpa — relative vector only
-    s = t_cpa - t_lo
-    rel = (r0[0]+vr[0]*s, r0[1]+vr[1]*s, r0[2]+vr[2]*s)
+    cx = D0x + t_cpa_s * Dvx
+    cy = D0y + t_cpa_s * Dvy
+    cz = D0z + t_cpa_s * Dvz
 
-    d3   = math.sqrt(rel[0]**2 + rel[1]**2 + rel[2]**2)
-    d2   = math.sqrt(rel[0]**2 + rel[1]**2)
-    dv   = abs(rel[2])
-    return d3, d2, dv, t_cpa
+    d_h = math.sqrt(cx*cx + cy*cy)
+    d_v = abs(cz)
 
-
-def _effective_radius(wp_a: Waypoint4D, wp_b: Waypoint4D) -> float:
-    """
-    Effective horizontal protection radius combining both drones' uncertainty.
-    R_eff = R_BASE + speed_A * sigma_A + speed_B * sigma_B
-    """
-    return (config.CPA_R_BASE
-            + wp_a.speed * wp_a.sigma_t
-            + wp_b.speed * wp_b.sigma_t)
-
-
-def _wp_is_terminal(wp: Waypoint4D) -> bool:
-    return wp.phase in (FlightPhase.TERMINAL, FlightPhase.GROUND)
+    return d_h < r_eff and d_v < v_sep
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TRAJECTORY SHIFT  (uniform takeoff delay)
+# TRAJECTORY-LEVEL CONFLICT CHECK
 # ══════════════════════════════════════════════════════════════════════════════
 
-def apply_delay(traj: Trajectory4D, extra_delay: float) -> Trajectory4D:
+def trajectories_conflict(
+    traj_a: Trajectory4D,
+    traj_b: Trajectory4D,
+) -> bool:
     """
-    Shift every ETA in the trajectory by extra_delay seconds.
-    Keeps base_start_time and accumulates takeoff_delay for bookkeeping.
+    Return True if traj_a and traj_b ever violate the protected airspace
+    cylinder (horizontal R_eff × vertical V_SEP) at any point during their
+    overlapping flight time.
+
+    Uses pairwise analytic CPA over all segment combinations.
+    Complexity: O(|A| × |B|) — manageable at planning time (< 50 waypoints
+    per trajectory).
+
+    GROUND-phase waypoints are excluded (drones on the pad do not occupy
+    airspace).
     """
-    new_wps = []
-    for wp in traj.waypoints:
-        new_wps.append(Waypoint4D(
-            position=wp.position,
-            eta=wp.eta + extra_delay,
-            speed=wp.speed,
-            heading=wp.heading,
-            phase=wp.phase,
-            sigma_t=wp.sigma_t,
-            anchor_bindings=wp.anchor_bindings,
-        ))
-    return Trajectory4D(
-        waypoints=new_wps,
-        total_distance=traj.total_distance,
-        total_time=traj.total_time,
-        estimated_battery_usage=traj.estimated_battery_usage,
-        takeoff_delay=traj.takeoff_delay + extra_delay,
-        base_start_time=traj.base_start_time,
-        stratum=traj.stratum,
-        direction=traj.direction,
+    wps_a = [w for w in traj_a.waypoints if w.phase != FlightPhase.GROUND]
+    wps_b = [w for w in traj_b.waypoints if w.phase != FlightPhase.GROUND]
+
+    if not wps_a or not wps_b:
+        return False
+
+    # Reference point for local Cartesian conversion
+    ref_lat = wps_a[0].position.latitude
+    ref_lon = wps_a[0].position.longitude
+
+    r_base = getattr(config, 'DRONE_PROTECTION_RADIUS', 50.0)
+    v_sep  = getattr(config, 'DRONE_VERTICAL_SEPARATION', 10.0)
+
+    # Pre-convert all waypoints to (x, y, z, eta, sigma_t) tuples
+    def _convert(wps):
+        out = []
+        for w in wps:
+            x, y = _lat_lon_to_xy_local(
+                w.position.latitude, w.position.longitude, ref_lat, ref_lon
+            )
+            out.append((x, y, w.position.altitude, w.eta, w.sigma_t))
+        return out
+
+    pts_a = _convert(wps_a)
+    pts_b = _convert(wps_b)
+
+    for i in range(len(pts_a) - 1):
+        ax0, ay0, az0, ta0, sa0 = pts_a[i]
+        ax1, ay1, az1, ta1, sa1 = pts_a[i + 1]
+
+        for j in range(len(pts_b) - 1):
+            bx0, by0, bz0, tb0, sb0 = pts_b[j]
+            bx1, by1, bz1, tb1, sb1 = pts_b[j + 1]
+
+            # Effective protection radius expands with combined sigma_t
+            avg_sigma = 0.5 * (sa0 + sa1 + sb0 + sb1) / 2.0
+            r_eff = r_base + _CPA_SIGMA_SCALE * avg_sigma
+
+            if _cpa_segment_pair(
+                ax0, ay0, az0, ax1, ay1, az1,
+                bx0, by0, bz0, bx1, by1, bz1,
+                ta0, ta1, tb0, tb1,
+                r_eff, v_sep,
+            ):
+                return True
+
+    return False
+
+
+def has_any_conflict(candidate: Trajectory4D,
+                     active_trajs: Dict[str, Trajectory4D],
+                     exclude_id: Optional[str] = None) -> bool:
+    """
+    Return True if `candidate` conflicts with ANY trajectory in `active_trajs`.
+    Skips `exclude_id` (typically the drone being replanned).
+    """
+    for drone_id, traj in active_trajs.items():
+        if drone_id == exclude_id:
+            continue
+        if trajectories_conflict(candidate, traj):
+            return True
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRAJECTORY HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _extract_latlon_path(traj: Trajectory4D) -> List[Tuple[float, float]]:
+    """Extract (lat, lon) pairs from CRUISE + TERMINAL waypoints (not GROUND)."""
+    return [
+        (w.position.latitude, w.position.longitude)
+        for w in traj.waypoints
+        if w.phase not in (FlightPhase.GROUND,)
+    ]
+
+
+def _final_eta(traj: Trajectory4D) -> float:
+    """Return the ETA of the last waypoint (touchdown)."""
+    return traj.waypoints[-1].eta
+
+
+def _shift_trajectory_eta(traj: Trajectory4D, delay: float) -> Trajectory4D:
+    """
+    Return a shallow copy of traj with every waypoint ETA shifted forward
+    by `delay` seconds.  Used for takeoff-delay fallback.
+    """
+    from copy import deepcopy
+    new_traj = deepcopy(traj)
+    for wp in new_traj.waypoints:
+        wp.eta += delay
+    new_traj.base_start_time = traj.base_start_time + delay
+    return new_traj
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRATUM REBUILDER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _rebuild_at_stratum(
+    traj:        Trajectory4D,
+    new_stratum: int,
+    start_pos:   Position,
+    goal_pos:    Position,
+    latlon_path: List[Tuple[float, float]],
+) -> Trajectory4D:
+    """
+    Rebuild the trajectory at a different altitude stratum.
+
+    Recomputes anchor bindings from scratch (not a copy) so that
+    expected_dist_m values are computed for the new altitude.  Copying them
+    from the old trajectory would corrupt WLS residuals when the drone is
+    handed to the GPS-denied positioning module.
+    """
+    return pathfinding.build_4d_trajectory(
+        latlon_path,
+        start_pos,
+        goal_pos,
+        new_stratum,
+        traj.direction,
+        traj.base_start_time,
     )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# OPTION A — SPEED REDUCTION
+# ══════════════════════════════════════════════════════════════════════════════
 
-def reassign_stratum(traj: Trajectory4D,
-                     new_stratum: int,
-                     pickup_pos: Position,
-                     delivery_pos: Position) -> Trajectory4D:
+def _speed_reduced_trajectory(
+    traj:          Trajectory4D,
+    start_pos:     Position,
+    goal_pos:      Position,
+    latlon_path:   List[Tuple[float, float]],
+    target_speed:  float,
+) -> Trajectory4D:
     """
-    Return a new Trajectory4D with all CRUISE waypoints shifted to new_stratum,
-    and CLIMB/DESCENT waypoints linearly interpolated to match.
+    Rebuild the trajectory with a lower cruise speed.
 
-    BUG FIX: anchor_bindings are now RE-COMPUTED for every waypoint at its
-    new altitude instead of being blindly copied from the old trajectory.
+    Kinematic turn penalties are re-evaluated at the new speed:
+        V_corner = target_speed × cos(Δθ / 2)   [clamped to DRONE_MIN_SPEED]
+    so that corner-slow-down effects are realistic at the reduced cruise.
 
-    When reassign_stratum() copied the old bindings, two problems occurred:
-      1. expected_dist_m was computed at the old altitude — the WLS residuals
-         (measured − expected) had a large systematic bias, corrupting the
-         position-correction vector.
-      2. The node set was optimised for the old altitude geometry.  After a
-         30 m stratum change some of those nodes fall outside ANCHOR_MAX_RANGE,
-         while better-geometry nodes that are now in range go unused.
-
-    Recomputing via compute_anchor_bindings() costs one GDOP pass per waypoint
-    but runs entirely in the planning thread and is negligible compared to the
-    OSRM / CPA work that precedes it.
+    This is used by Option A of the Path-vs-Speed resolver.
     """
-    old_stratum = traj.stratum
-    if old_stratum == 0:
-        old_stratum = new_stratum
+    return pathfinding.build_4d_trajectory(
+        latlon_path,
+        start_pos,
+        goal_pos,
+        traj.stratum,
+        traj.direction,
+        traj.base_start_time,
+        cruise_speed_override=target_speed,
+    )
 
-    cruise_indices = [i for i, wp in enumerate(traj.waypoints)
-                      if wp.phase == FlightPhase.CRUISE]
-    first_cruise = cruise_indices[0]  if cruise_indices else len(traj.waypoints) // 2
-    last_cruise  = cruise_indices[-1] if cruise_indices else len(traj.waypoints) // 2
 
-    new_wps = []
-    for i, wp in enumerate(traj.waypoints):
-        pos = wp.position
+def _find_min_speed_no_conflict(
+    traj:         Trajectory4D,
+    start_pos:    Position,
+    goal_pos:     Position,
+    latlon_path:  List[Tuple[float, float]],
+    active_trajs: Dict[str, Trajectory4D],
+    exclude_id:   Optional[str],
+) -> Optional[Tuple[float, Trajectory4D]]:
+    """
+    Binary-search for the minimum cruise speed at which the primary path is
+    conflict-free.
 
-        if wp.phase == FlightPhase.CRUISE:
-            new_alt = float(new_stratum)
+    Search range: [DRONE_MIN_SPEED, current stratum cruise speed].
+    Turn penalties are included in both the rebuilt trajectory (for CPA
+    checking) and the ETA estimate, ensuring a fair comparison with Option B.
 
-        elif wp.phase == FlightPhase.CLIMB:
-            ratio   = pos.altitude / old_stratum if old_stratum else 0
-            new_alt = ratio * new_stratum
+    Returns
+    -------
+    (speed_found, rebuilt_trajectory) if a speed was found, else None.
 
-        elif wp.phase == FlightPhase.DESCENT:
-            ratio   = pos.altitude / old_stratum if old_stratum else 0
-            new_alt = ratio * new_stratum
+    The returned speed is the slowest that just barely clears all conflicts,
+    so the returned trajectory's ETA is the best achievable on this path.
+    """
+    v_min    = config.DRONE_MIN_SPEED
+    v_max    = config.DRONE_CRUISE_SPEED
+    v_lo, v_hi = v_min, v_max
 
-        elif wp.phase == FlightPhase.TERMINAL:
-            ratio   = pos.altitude / old_stratum if old_stratum else 0
-            new_alt = ratio * new_stratum
+    # Fast check: even at minimum speed, do we conflict?
+    min_speed_traj = _speed_reduced_trajectory(
+        traj, start_pos, goal_pos, latlon_path, v_lo
+    )
+    if has_any_conflict(min_speed_traj, active_trajs, exclude_id):
+        # Speed reduction cannot resolve the conflict on this path
+        return None
 
+    # Confirmed: somewhere between v_lo and v_hi there is a working speed.
+    # Binary search for the *fastest* speed that is still conflict-free
+    # (we want earliest arrival → highest speed that works).
+    #
+    # Invariant: v_lo always works, v_hi may or may not.
+    best_speed = v_lo
+    best_traj  = min_speed_traj
+
+    for _ in range(_SPEED_BISECT_ITERS):
+        v_mid = (v_lo + v_hi) / 2.0
+        if v_mid - v_lo < 0.05:   # 0.05 m/s resolution is sufficient
+            break
+        candidate = _speed_reduced_trajectory(
+            traj, start_pos, goal_pos, latlon_path, v_mid
+        )
+        if has_any_conflict(candidate, active_trajs, exclude_id):
+            v_hi = v_mid           # too fast — still conflicts
         else:
-            new_alt = pos.altitude   # GROUND stays at 0
+            v_lo      = v_mid      # faster and clear — keep as best
+            best_speed = v_mid
+            best_traj  = candidate
 
-        new_alt = max(0.0, min(new_alt, 130.0))
-        new_pos = Position(latitude=pos.latitude,
-                           longitude=pos.longitude,
-                           altitude=new_alt)
+    print(f"[Resolver] Option A: speed reduced to "
+          f"{best_speed:.1f} m/s, ETA={_final_eta(best_traj):.1f}s")
+    return best_speed, best_traj
 
-        # ── FIX: recompute anchor bindings for the new altitude ───────────────
-        # The old bindings had expected_dist_m calibrated to the previous
-        # stratum altitude.  Using them at the new altitude produces large
-        # systematic WLS residuals and corrupts the position correction.
-        wp_xyz = anchor_registry._to_xyz(pos.latitude, pos.longitude,
-                                         min(new_alt, 130.0))
-        new_bindings, _, _ = anchor_registry.compute_anchor_bindings(wp_xyz)
-        # ─────────────────────────────────────────────────────────────────────
-
-        new_wps.append(Waypoint4D(
-            position=new_pos,
-            eta=wp.eta,
-            speed=wp.speed,
-            heading=wp.heading,
-            phase=wp.phase,
-            sigma_t=wp.sigma_t,
-            anchor_bindings=new_bindings,   # ← was: wp.anchor_bindings
-        ))
-
-    return Trajectory4D(
-        waypoints=new_wps,
-        total_distance=traj.total_distance,
-        total_time=traj.total_time,
-        estimated_battery_usage=traj.estimated_battery_usage,
-        takeoff_delay=traj.takeoff_delay,
-        base_start_time=traj.base_start_time,
-        stratum=new_stratum,
-        direction=traj.direction,
-    )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONFLICT CHECKER
+# OPTION B — ALTERNATIVE PATH SELECTION
 # ══════════════════════════════════════════════════════════════════════════════
 
-class ConflictInfo:
-    """Lightweight conflict record used inside the resolver."""
-    __slots__ = ('drone_id', 'cpa_dist_h', 'cpa_dist_v',
-                 'cpa_time', 'r_eff', 'severity')
-
-    def __init__(self, drone_id: str, cpa_dist_h: float, cpa_dist_v: float,
-                 cpa_time: float, r_eff: float) -> None:
-        self.drone_id   = drone_id
-        self.cpa_dist_h = cpa_dist_h
-        self.cpa_dist_v = cpa_dist_v
-        self.cpa_time   = cpa_time
-        self.r_eff      = r_eff
-        self.severity   = ('critical' if cpa_dist_h < r_eff * 0.5 else
-                           'warning'  if cpa_dist_h < r_eff * 0.75 else 'minor')
-
-
-def check_trajectory_vs_all(
-    candidate: Trajectory4D,
-    existing:  Dict[str, Trajectory4D],
-) -> List[ConflictInfo]:
+def _find_fastest_clear_alternative(
+    alternatives:  List[Trajectory4D],
+    active_trajs:  Dict[str, Trajectory4D],
+    exclude_id:    Optional[str],
+) -> Optional[Trajectory4D]:
     """
-    Check candidate trajectory against every approved trajectory.
-    Returns list of ConflictInfo (empty = clear).
+    Scan the pre-built Yen's alternative trajectories (paths 2-5) in order
+    of ascending travel time (they arrive sorted that way from plan_trajectory)
+    and return the first one that is conflict-free.
 
-    Skips segment pairs where BOTH endpoints are TERMINAL / GROUND phase —
-    those are handled by the pad queue.
+    The alternatives are already built with full cruise speed V_cruise and
+    include kinematic turn penalties in their ETAs (because they were built
+    by build_4d_trajectory which uses _turn_speed() per CRUISE waypoint).
+
+    Returns the earliest-arrival conflict-free alternative, or None.
     """
-    conflicts: List[ConflictInfo] = []
+    for idx, alt in enumerate(alternatives):
+        if not has_any_conflict(alt, active_trajs, exclude_id):
+            print(f"[Resolver] Option B: alternative path {idx+1} is clear, "
+                  f"ETA={_final_eta(alt):.1f}s")
+            return alt
 
-    for drone_id, traj in existing.items():
-        worst_h   = float('inf')
-        worst_v   = float('inf')
-        worst_t   = 0.0
-        worst_ref = 0.0
+    print("[Resolver] Option B: all alternatives still conflict")
+    return None
 
-        wps_a = candidate.waypoints
-        wps_b = traj.waypoints
 
-        for i in range(len(wps_a) - 1):
-            wp_a0, wp_a1 = wps_a[i], wps_a[i+1]
-            # Skip if both endpoints are terminal/ground
-            if _wp_is_terminal(wp_a0) and _wp_is_terminal(wp_a1):
-                continue
+# ══════════════════════════════════════════════════════════════════════════════
+# FALLBACK — TAKEOFF DELAY
+# ══════════════════════════════════════════════════════════════════════════════
 
-            for j in range(len(wps_b) - 1):
-                wp_b0, wp_b1 = wps_b[j], wps_b[j+1]
-                if _wp_is_terminal(wp_b0) and _wp_is_terminal(wp_b1):
-                    continue
+def _find_min_delay_no_conflict(
+    traj:         Trajectory4D,
+    active_trajs: Dict[str, Trajectory4D],
+    exclude_id:   Optional[str],
+) -> Optional[Trajectory4D]:
+    """
+    Binary-search the smallest takeoff delay that makes the primary trajectory
+    conflict-free.
 
-                # Time window overlap?
-                t_lo = max(wp_a0.eta, wp_b0.eta)
-                t_hi = min(wp_a1.eta, wp_b1.eta)
-                if t_lo >= t_hi:
-                    continue
+    This is the original fallback behaviour, applied only when both Layer 1
+    and Layer 2 fail to resolve the conflict on any path or speed.
+    Maximum search window: 10 minutes.
+    """
+    d_lo, d_hi = 0.0, 600.0
 
-                # Convert to metric Cartesian
-                a0m = _to_metres(wp_a0.position.latitude,
-                                 wp_a0.position.longitude,
-                                 wp_a0.position.altitude)
-                a1m = _to_metres(wp_a1.position.latitude,
-                                 wp_a1.position.longitude,
-                                 wp_a1.position.altitude)
-                b0m = _to_metres(wp_b0.position.latitude,
-                                 wp_b0.position.longitude,
-                                 wp_b0.position.altitude)
-                b1m = _to_metres(wp_b1.position.latitude,
-                                 wp_b1.position.longitude,
-                                 wp_b1.position.altitude)
+    # Verify that some delay actually works
+    shifted = _shift_trajectory_eta(traj, d_hi)
+    if has_any_conflict(shifted, active_trajs, exclude_id):
+        return None    # even 10-minute delay doesn't help
 
-                _, d_h, d_v, t_cpa = _segment_cpa(
-                    a0m, a1m, wp_a0.eta, wp_a1.eta,
-                    b0m, b1m, wp_b0.eta, wp_b1.eta,
-                )
+    for _ in range(_DELAY_BISECT_ITERS):
+        d_mid = (d_lo + d_hi) / 2.0
+        if d_hi - d_lo < 0.5:
+            break
+        if has_any_conflict(_shift_trajectory_eta(traj, d_mid),
+                            active_trajs, exclude_id):
+            d_lo = d_mid
+        else:
+            d_hi = d_mid
 
-                # Effective radius uses sigma_t at the CPA waypoints
-                r_eff = _effective_radius(wp_a0, wp_b0)
-
-                if d_h < r_eff and d_v < config.CPA_V_SEP:
-                    if d_h < worst_h:
-                        worst_h   = d_h
-                        worst_v   = d_v
-                        worst_t   = t_cpa
-                        worst_ref = r_eff
-
-        if worst_h < float('inf'):
-            conflicts.append(ConflictInfo(
-                drone_id=drone_id,
-                cpa_dist_h=worst_h,
-                cpa_dist_v=worst_v,
-                cpa_time=worst_t,
-                r_eff=worst_ref,
-            ))
-
-    return conflicts
+    result = _shift_trajectory_eta(traj, d_hi)
+    print(f"[Resolver] Fallback: takeoff delay {d_hi:.1f}s, "
+          f"ETA={_final_eta(result):.1f}s")
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN RESOLVER
 # ══════════════════════════════════════════════════════════════════════════════
 
-class ConflictResolver:
+def resolve_conflict(
+    drone_id:     str,
+    primary:      Trajectory4D,
+    alternatives: List[Trajectory4D],
+    active_trajs: Dict[str, Trajectory4D],
+    start_pos:    Position,
+    goal_pos:     Position,
+    latlon_path:  List[Tuple[float, float]],
+) -> Tuple[Trajectory4D, str]:
     """
-    Preventive 4-D conflict resolution applied at planning time.
+    Resolve all conflicts for `drone_id`'s proposed primary trajectory.
 
-    Usage (called from main.py):
-        resolved_traj, alert = resolver.resolve(
-            candidate_traj, existing_flight_plans,
-            pickup_pos, delivery_pos
-        )
+    Parameters
+    ----------
+    drone_id     : ID of the drone being planned (excluded from self-conflict
+                   checks; lower ID = higher priority).
+    primary      : The freshly planned primary trajectory.
+    alternatives : Yen's alternative trajectories (paths 2-5), pre-built at
+                   full speed, sorted by travel time ascending.
+    active_trajs : All currently active drone trajectories (including others
+                   whose IDs are lexicographically lower than drone_id — those
+                   are higher-priority and immovable).
+    start_pos    : Original pickup position (needed for stratum + speed rebuild).
+    goal_pos     : Original delivery position.
+    latlon_path  : 2-D road/visibility waypoints of the primary trajectory
+                   (needed for rebuild without re-running pathfinding).
 
-    Returns (Trajectory4D, ConflictAlert|None).
-    If the airspace is saturated, raises AirspaceSaturatedError.
+    Returns
+    -------
+    (resolved_trajectory, resolution_method_label)
+
+    Resolution method labels: see module-level _RES_* constants.
     """
+    # Fast exit — no conflict with anyone
+    if not has_any_conflict(primary, active_trajs, exclude_id=drone_id):
+        return primary, 'NO_CONFLICT'
 
-    def resolve(
-        self,
-        candidate:     Trajectory4D,
-        existing:      Dict[str, Trajectory4D],
-        pickup_pos:    Position,
-        delivery_pos:  Position,
-    ) -> Tuple[Trajectory4D, Optional[ConflictAlert]]:
-        """
-        Run the full cascade resolution loop.
-        Returns final trajectory and a ConflictAlert if resolution was needed.
-        Raises AirspaceSaturatedError if unresolvable.
-        """
-        if not existing:
-            return candidate, None
+    print(f"[Resolver] Conflict detected for {drone_id} — starting resolution")
 
-        planning_start = time.monotonic()
-        alert: Optional[ConflictAlert] = None
-        traj = candidate
-        total_delay_applied = 0.0
+    # ── LAYER 1: Stratum reassignment ─────────────────────────────────────────
+    all_strata = getattr(config, 'ALL_STRATA_ORDERED',
+                         [60, 70, 80, 90, 100, 110, 120])
 
-        for full_pass in range(config.MAX_RESOLUTION_PASSES):
+    for new_stratum in all_strata:
+        if new_stratum == primary.stratum:
+            continue                    # already tried the primary stratum
 
-            # Reset per-pass state so previously-failed strata are retried
-            # after the conflict landscape changes (e.g. a delay was applied).
-            tried_strata: set = set()
-
-            # ── Wall-clock timeout ────────────────────────────────────────────
-            elapsed = time.monotonic() - planning_start
-            if elapsed > config.RESOLUTION_TIMEOUT:
-                raise AirspaceSaturatedError(
-                    f"Planning timeout after {elapsed:.1f}s",
-                    retry_after=self._earliest_free_slot(candidate, existing),
-                    conflicts=len(check_trajectory_vs_all(traj, existing)),
-                )
-
-            conflicts = check_trajectory_vs_all(traj, existing)
-
-            if not conflicts:
-                break   # Clean — done
-
-            # Sort by earliest CPA time (fix the nearest conflict first)
-            conflicts.sort(key=lambda c: c.cpa_time)
-            worst = conflicts[0]
-
-            print(f"[Resolver] Pass {full_pass+1}: "
-                  f"{len(conflicts)} conflict(s), worst with drone "
-                  f"{worst.drone_id} at t={worst.cpa_time:.1f}s "
-                  f"d_h={worst.cpa_dist_h:.1f}m (need {worst.r_eff:.1f}m)")
-
-            resolved_this_pass = False
-
-            # ── Resolution 1: Try a different altitude stratum ────────────────
-            strata_by_distance = sorted(
-                [s for s in config.ALL_STRATA_ORDERED
-                 if s != traj.stratum and s not in tried_strata],
-                key=lambda s: abs(s - traj.stratum)
-            )
-
-            for alt_s in strata_by_distance:
-                tried_strata.add(alt_s)
-                candidate_alt = reassign_stratum(traj, alt_s,
-                                                 pickup_pos, delivery_pos)
-                if not check_trajectory_vs_all(candidate_alt, existing):
-                    print(f"[Resolver] ✓ Resolution 1: stratum {traj.stratum}m "
-                          f"-> {alt_s}m clears all conflicts")
-                    traj = candidate_alt
-                    alert = self._make_alert(worst, traj, "altitude_change")
-                    resolved_this_pass = True
-                    break
-
-            if resolved_this_pass:
-                continue   # Re-validate on next full pass
-
-            # ── Resolution 2: Uniform takeoff delay ──────────────────────────
-            # Binary-search the minimum delay in [lo, MAX_TAKEOFF_DELAY]
-            # that makes the trajectory clear of all existing traffic.
-            combined_sigma = (
-                traj.waypoints[0].sigma_t
-                + existing[worst.drone_id].waypoints[0].sigma_t
-            )
-            delay_lo  = combined_sigma + config.TEMPORAL_SAFETY_MARGIN
-            delay_hi  = config.MAX_TAKEOFF_DELAY - total_delay_applied
-
-            if delay_lo > delay_hi:
-                # Already at max delay budget
-                retry = self._earliest_free_slot(candidate, existing)
-                raise AirspaceSaturatedError(
-                    "All strata blocked and max delay budget exhausted",
-                    retry_after=retry,
-                    conflicts=len(conflicts),
-                )
-
-            best_delay = self._binary_search_delay(
-                traj, existing, delay_lo, delay_hi
-            )
-
-            if best_delay is not None:
-                traj = apply_delay(traj, best_delay)
-                total_delay_applied += best_delay
-                print(f"[Resolver] ✓ Resolution 2: delay +{best_delay:.1f}s "
-                      f"(total {total_delay_applied:.1f}s)")
-                alert = self._make_alert(worst, traj, "speed_adjustment")
-                resolved_this_pass = True
-                continue
-
-            # Both resolutions exhausted
-            retry = self._earliest_free_slot(candidate, existing)
-            raise AirspaceSaturatedError(
-                "Could not find conflict-free trajectory",
-                retry_after=retry,
-                conflicts=len(conflicts),
-            )
-
-        else:
-            # Exceeded MAX_RESOLUTION_PASSES
-            retry = self._earliest_free_slot(candidate, existing)
-            raise AirspaceSaturatedError(
-                f"Exceeded {config.MAX_RESOLUTION_PASSES} resolution passes",
-                retry_after=retry,
-                conflicts=len(check_trajectory_vs_all(traj, existing)),
-            )
-
-        return traj, alert
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _binary_search_delay(
-        self,
-        traj:     Trajectory4D,
-        existing: Dict[str, Trajectory4D],
-        lo:       float,
-        hi:       float,
-        n_iter:   int = 8,
-    ) -> Optional[float]:
-        """
-        Binary-search for the minimum delay in [lo, hi] that clears all conflicts.
-        Returns the delay in seconds, or None if even hi doesn't clear them.
-        """
-        # First check if hi works at all
-        if check_trajectory_vs_all(apply_delay(traj, hi), existing):
-            return None   # Even max delay doesn't help
-
-        # Fast-path: if the minimum delay already clears everything, use it
-        if not check_trajectory_vs_all(apply_delay(traj, lo), existing):
-            return lo
-
-        for _ in range(n_iter):
-            mid = (lo + hi) / 2
-            if check_trajectory_vs_all(apply_delay(traj, mid), existing):
-                lo = mid   # mid still has conflicts — need more delay
-            else:
-                hi = mid   # mid is clean — try less
-
-        return hi   # smallest delay that was consistently clean
-
-    def _earliest_free_slot(
-        self,
-        candidate: Trajectory4D,
-        existing:  Dict[str, Trajectory4D],
-    ) -> float:
-        """
-        Estimate the earliest future time when the airspace might clear
-        (the end of the last in-flight trajectory).
-        """
-        if not existing:
-            return time.time()
-        latest_end = max(t.waypoints[-1].eta for t in existing.values())
-        return latest_end + config.PAD_CLEARANCE_TIME
-
-    def _make_alert(
-        self,
-        conflict: ConflictInfo,
-        resolved_traj: Trajectory4D,
-        method: str,
-    ) -> ConflictAlert:
-        # Find closest waypoint to conflict time for position
-        wps = resolved_traj.waypoints
-        closest = min(wps, key=lambda w: abs(w.eta - conflict.cpa_time))
-        return ConflictAlert(
-            conflict_id=str(uuid.uuid4()),
-            drone_1_id="new_drone",
-            drone_2_id=conflict.drone_id,
-            conflict_position=closest.position,
-            conflict_time=conflict.cpa_time,
-            severity=conflict.severity,
-            resolution_action=method,
+        candidate = _rebuild_at_stratum(
+            primary, new_stratum, start_pos, goal_pos, latlon_path
         )
+        if not has_any_conflict(candidate, active_trajs, exclude_id=drone_id):
+            print(f"[Resolver] Layer 1 ✓ stratum={new_stratum}m, "
+                  f"ETA={_final_eta(candidate):.1f}s")
+            return candidate, f'{_RES_STRATUM}_{new_stratum}m'
 
-    # ── Legacy compatibility (called from old main.py code) ───────────────────
-    conflict_detector = None  # replaced by check_trajectory_vs_all
+    print("[Resolver] Layer 1 exhausted — all strata conflict")
 
-    def check_trajectory_conflict(self, id1, traj1, id2, traj2):
-        """Legacy shim — returns ConflictAlert-compatible object or None."""
-        t1_4d = _legacy_to_4d(traj1)
-        t2_4d = _legacy_to_4d(traj2)
-        infos = check_trajectory_vs_all(t1_4d, {id2: t2_4d})
-        if not infos:
-            return None
-        info = infos[0]
-        wps = t1_4d.waypoints
-        closest = min(wps, key=lambda w: abs(w.eta - info.cpa_time))
-        return ConflictAlert(
-            conflict_id=str(uuid.uuid4()),
-            drone_1_id=id1,
-            drone_2_id=id2,
-            conflict_position=closest.position,
-            conflict_time=info.cpa_time,
-            severity=info.severity,
-            resolution_action=None,
-        )
+    # ── LAYER 2: Path vs. Speed trade-off ─────────────────────────────────────
 
-
-def _legacy_to_4d(traj) -> Trajectory4D:
-    """Wrap a legacy Trajectory in a minimal Trajectory4D for CPA checks."""
-    from models import Waypoint4D, FlightPhase
-    wps4d = [
-        Waypoint4D(
-            position=wp.position,
-            eta=wp.eta,
-            speed=wp.speed,
-            heading=wp.heading,
-            phase=FlightPhase.CRUISE,
-            sigma_t=config.CPA_SIGMA_0,
-        )
-        for wp in traj.waypoints
-    ]
-    return Trajectory4D(
-        waypoints=wps4d,
-        total_distance=traj.total_distance,
-        total_time=traj.total_time,
-        estimated_battery_usage=traj.estimated_battery_usage,
+    # --- Option A: speed reduction on the primary path ----------------------
+    option_a_result = _find_min_speed_no_conflict(
+        primary, start_pos, goal_pos, latlon_path,
+        active_trajs, exclude_id=drone_id
     )
 
+    # --- Option B: fastest conflict-free Yen's alternative ------------------
+    # Skip path 0 (same as primary), use paths 1 .. K-1
+    option_b_result = _find_fastest_clear_alternative(
+        alternatives[1:],          # paths 2-5 (index 1 onward)
+        active_trajs,
+        exclude_id=drone_id,
+    )
+
+    # --- Select: whichever ETA is earlier -----------------------------------
+    if option_a_result is not None and option_b_result is not None:
+        _, traj_a = option_a_result
+        eta_a = _final_eta(traj_a)
+        eta_b = _final_eta(option_b_result)
+
+        if eta_a <= eta_b:
+            print(f"[Resolver] Layer 2 ✓ Option A wins "
+                  f"(ETA_A={eta_a:.1f}s < ETA_B={eta_b:.1f}s)")
+            return traj_a, _RES_SPEED
+        else:
+            print(f"[Resolver] Layer 2 ✓ Option B wins "
+                  f"(ETA_B={eta_b:.1f}s < ETA_A={eta_a:.1f}s)")
+            return option_b_result, _RES_ALT_PATH
+
+    elif option_a_result is not None:
+        _, traj_a = option_a_result
+        print(f"[Resolver] Layer 2 ✓ Option A only "
+              f"(ETA={_final_eta(traj_a):.1f}s)")
+        return traj_a, _RES_SPEED
+
+    elif option_b_result is not None:
+        print(f"[Resolver] Layer 2 ✓ Option B only "
+              f"(ETA={_final_eta(option_b_result):.1f}s)")
+        return option_b_result, _RES_ALT_PATH
+
+    print("[Resolver] Layer 2 exhausted — falling back to takeoff delay")
+
+    # ── FALLBACK: Takeoff delay on primary trajectory ─────────────────────────
+    delayed = _find_min_delay_no_conflict(primary, active_trajs, drone_id)
+    if delayed is not None:
+        return delayed, _RES_DELAY
+
+    # ── UNRESOLVED ─────────────────────────────────────────────────────────────
+    print(f"[Resolver] ⚠ Could not resolve conflict for {drone_id}")
+    return primary, _RES_NONE
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ERRORS
+# BACKWARD-COMPAT LAYER  (consumed by main.py — do not remove)
 # ══════════════════════════════════════════════════════════════════════════════
+
+# Public alias so main.py's `conflict_detection.apply_delay(traj, d)` still works.
+apply_delay = _shift_trajectory_eta
+
 
 class AirspaceSaturatedError(Exception):
-    def __init__(self, reason: str, retry_after: float, conflicts: int) -> None:
-        super().__init__(reason)
+    """
+    Raised when no resolution strategy can clear a conflict.
+    Carries enough context for main.py to return a 503 with retry guidance.
+    """
+    def __init__(self, message: str,
+                 retry_after: float = 30.0,
+                 conflicts: Optional[List[str]] = None):
+        super().__init__(message)
         self.retry_after = retry_after
-        self.conflicts   = conflicts
+        self.conflicts   = conflicts or []
 
 
-# ── Legacy class kept for import compatibility ────────────────────────────────
-class ConflictDetector:
-    """Legacy stub — CPA logic is now in check_trajectory_vs_all()."""
-    def __init__(self):
-        self.active_conflicts = []
+# ── Pad Queue ─────────────────────────────────────────────────────────────────
+# Minimal FIFO pad-slot manager.  Preserves the original PAD_QUEUE_ENABLED
+# bypass behaviour: when False, every pad is treated as immediately available.
 
-    def check_trajectory_conflict(self, id1, traj1, id2, traj2):
-        resolver = ConflictResolver()
-        return resolver.check_trajectory_conflict(id1, traj1, id2, traj2)
+PAD_QUEUE_ENABLED: bool = getattr(config, 'PAD_QUEUE_ENABLED', False)
+
+
+class _PadQueue:
+    """
+    Tracks time-window reservations for landing pads.
+
+    Each pad is identified by a (lat, lon) pair rounded to 5 decimal places.
+    Each reservation is keyed by drone_id and stores (start, end) in epoch
+    seconds.  Pad slots are released explicitly by drone_id.
+    """
+
+    def __init__(self) -> None:
+        # pad_key → list of (drone_id, start, end)
+        self._slots: Dict[str, List[tuple]] = {}
+
+    def _pad_key(self, lat: float, lon: float) -> str:
+        return f"{round(lat, 5)},{round(lon, 5)}"
+
+    def reserve(self, drone_id: str,
+                lat: float, lon: float,
+                start: float, end: float) -> None:
+        key = self._pad_key(lat, lon)
+        if key not in self._slots:
+            self._slots[key] = []
+        # Remove any existing reservation for this drone on this pad first
+        self._slots[key] = [s for s in self._slots[key] if s[0] != drone_id]
+        self._slots[key].append((drone_id, start, end))
+
+    def release(self, drone_id: str) -> None:
+        for key in list(self._slots):
+            self._slots[key] = [s for s in self._slots[key] if s[0] != drone_id]
+
+    def earliest_available(self, lat: float, lon: float,
+                           not_before: float) -> float:
+        """
+        Return the earliest time >= not_before at which this pad is free.
+        """
+        key      = self._pad_key(lat, lon)
+        slots    = self._slots.get(key, [])
+        earliest = not_before
+
+        # Walk forward through overlapping reservations
+        changed = True
+        while changed:
+            changed = False
+            for _, start, end in slots:
+                if start < earliest + getattr(config, 'PAD_CLEARANCE_TIME', 30.0) \
+                        and end > earliest:
+                    earliest = end
+                    changed  = True
+
+        return earliest
+
+
+pad_queue = _PadQueue()

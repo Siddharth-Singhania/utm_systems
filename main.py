@@ -32,6 +32,11 @@ from models import (
     DeliveryRequest, Mission, Trajectory, Trajectory4D,
     DroneStatus, Position, ConflictAlert, SystemStatus,
 )
+from conflict_detection import (
+    has_any_conflict,
+    resolve_conflict,
+    trajectories_conflict,
+)
 import config
 import geofencing
 import conflict_detection
@@ -105,8 +110,6 @@ stats: Dict[str, int] = {
     "conflicts_detected": 0,
     "conflicts_resolved": 0,
 }
-
-resolver = conflict_detection.ConflictResolver()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -546,13 +549,19 @@ async def create_delivery(request: DeliveryRequest):
     blocked_path_json = [[p[0], p[1]] for p in direct_path] if was_rerouted else None
 
     # ── Step 3: Plan 4-D trajectory ───────────────────────────────────────────
-    # OSRM HTTP calls are blocking → thread pool
-    traj4d: Optional[Trajectory4D] = await asyncio.to_thread(
+    # plan_trajectory() now returns (primary_traj, alternatives) where
+    # alternatives is a list of up to K−1 pre-built Yen's trajectories at
+    # full speed, sorted by travel time.  The conflict resolver uses them
+    # for Layer-2 Option B (Path vs. Speed trade-off).
+    # OSRM HTTP calls are blocking → thread pool.
+    plan_result: Optional[tuple] = await asyncio.to_thread(
         pathfinding.plan_trajectory,
         request.pickup, request.delivery, time.time(),
     )
-    if traj4d is None:
+    if plan_result is None:
         raise HTTPException(500, "Could not find a valid flight path between those locations")
+
+    traj4d, traj4d_alternatives = plan_result
 
     print(f"[{mission_id}] ✓ Trajectory planned:"
           f"  {len(traj4d.waypoints)} wps"
@@ -602,28 +611,51 @@ async def create_delivery(request: DeliveryRequest):
         # takeoff delays as needed.
         print(f"[{mission_id}] Pad queue bypassed — immediate launch")
 
-    # ── Step 5: CPA conflict cascade (altitude → delay) ───────────────────────
+    # ── Step 5: CPA conflict cascade (Layer 1: altitude → Layer 2: path/speed) ─
     alert: Optional[ConflictAlert] = None
+    resolution_label: str = 'NO_CONFLICT'
     try:
-        traj4d, alert = await asyncio.to_thread(
-            resolver.resolve,
+        # Extract the 2-D road path from the primary trajectory so the
+        # resolver can rebuild at different strata / speeds without re-running
+        # OSRM.  GROUND waypoints are excluded (they sit on the pad at z=0).
+        latlon_path = [
+            (wp.position.latitude, wp.position.longitude)
+            for wp in traj4d.waypoints
+            if wp.phase.name != 'GROUND'
+        ]
+
+        resolved, resolution_label = await asyncio.to_thread(
+            conflict_detection.resolve_conflict,
+            drone_id,
             traj4d,
+            traj4d_alternatives,
             flight_plans_4d,
             request.pickup,
             request.delivery,
+            latlon_path,
         )
+        traj4d = resolved   # always use the (possibly unchanged) resolved traj
 
-        if alert:
+        if resolution_label != 'NO_CONFLICT':
             stats["conflicts_detected"] += 1
             stats["conflicts_resolved"] += 1
+            alert = ConflictAlert(
+                drone_id=drone_id,
+                conflicting_drone_id="detected",
+                conflict_time=time.time(),
+                conflict_position=traj4d.waypoints[0].position,
+                resolution_action=resolution_label,
+                new_stratum=traj4d.stratum,
+                delay_seconds=traj4d.takeoff_delay,
+            )
             print(f"[{mission_id}] ✓ Conflict resolved:"
-                  f"  method={alert.resolution_action}"
+                  f"  method={resolution_label}"
                   f"  delay={traj4d.takeoff_delay:.1f}s"
                   f"  stratum={traj4d.stratum}m")
             await manager.broadcast({
                 "type":              "conflict_resolved",
                 "conflict":          alert.model_dump(),
-                "resolution_method": alert.resolution_action,
+                "resolution_method": resolution_label,
                 "takeoff_delay_s":   traj4d.takeoff_delay,
                 "final_stratum_m":   traj4d.stratum,
             })
@@ -640,6 +672,17 @@ async def create_delivery(request: DeliveryRequest):
                 "conflicts":   exc.conflicts,
             },
         )
+
+    # ── WLS state reset on stratum change (Layer 1) ───────────────────────────
+    # When the resolver changes the stratum, anchor expected_dist_m values in
+    # the rebuilt trajectory are recomputed for the new altitude.  Clearing the
+    # per-drone WLS state ensures the GPS-denied module starts clean and doesn't
+    # carry over residuals from the old altitude.
+    if resolution_label.startswith('LAYER1_STRATUM'):
+        _wls_state.pop(drone_id, None)
+        _wls_wp_idx.pop(drone_id, None)
+        _wls_active_nodes.pop(drone_id, None)
+        print(f"[{mission_id}] WLS state reset — stratum changed to {traj4d.stratum}m")
     # ── Step 6: Re-reserve pad slots with final ETAs ──────────────────────────
     if conflict_detection.PAD_QUEUE_ENABLED:
         conflict_detection.pad_queue.release(drone_id)
