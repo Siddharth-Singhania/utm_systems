@@ -550,10 +550,10 @@ async def create_delivery(request: DeliveryRequest):
 
     # ── Step 3: Plan 4-D trajectory ───────────────────────────────────────────
     # plan_trajectory() now returns (primary_traj, alternatives) where
-    # alternatives is a list of up to K−1 pre-built Yen's trajectories at
-    # full speed, sorted by travel time.  The conflict resolver uses them
+    # alternatives is a list of up to K-1 pre-built Yen's trajectories at
+    # full speed, sorted by travel time. The conflict resolver uses them
     # for Layer-2 Option B (Path vs. Speed trade-off).
-    # OSRM HTTP calls are blocking → thread pool.
+    # OSRM HTTP calls are blocking → thread pool
     plan_result: Optional[tuple] = await asyncio.to_thread(
         pathfinding.plan_trajectory,
         request.pickup, request.delivery, time.time(),
@@ -615,9 +615,9 @@ async def create_delivery(request: DeliveryRequest):
     alert: Optional[ConflictAlert] = None
     resolution_label: str = 'NO_CONFLICT'
     try:
-        # Extract the 2-D road path from the primary trajectory so the
-        # resolver can rebuild at different strata / speeds without re-running
-        # OSRM.  GROUND waypoints are excluded (they sit on the pad at z=0).
+        # Extract the 2-D road path from the primary trajectory so the resolver
+        # can rebuild at different strata/speeds without re-running OSRM.
+        # GROUND waypoints are excluded (they sit on the pad at z=0).
         latlon_path = [
             (wp.position.latitude, wp.position.longitude)
             for wp in traj4d.waypoints
@@ -634,19 +634,19 @@ async def create_delivery(request: DeliveryRequest):
             request.delivery,
             latlon_path,
         )
-        traj4d = resolved   # always use the (possibly unchanged) resolved traj
+        traj4d = resolved
 
         if resolution_label != 'NO_CONFLICT':
             stats["conflicts_detected"] += 1
             stats["conflicts_resolved"] += 1
             alert = ConflictAlert(
-                drone_id=drone_id,
-                conflicting_drone_id="detected",
-                conflict_time=time.time(),
+                conflict_id=f"conflict_{uuid.uuid4().hex[:8]}",
+                drone_1_id=drone_id,
+                drone_2_id="detected",
                 conflict_position=traj4d.waypoints[0].position,
+                conflict_time=time.time(),
+                severity="HIGH",
                 resolution_action=resolution_label,
-                new_stratum=traj4d.stratum,
-                delay_seconds=traj4d.takeoff_delay,
             )
             print(f"[{mission_id}] ✓ Conflict resolved:"
                   f"  method={resolution_label}"
@@ -661,7 +661,6 @@ async def create_delivery(request: DeliveryRequest):
             })
 
     except conflict_detection.AirspaceSaturatedError as exc:
-        # Rollback pad reservations before rejecting
         conflict_detection.pad_queue.release(drone_id)
         raise HTTPException(
             status_code=503,
@@ -675,9 +674,9 @@ async def create_delivery(request: DeliveryRequest):
 
     # ── WLS state reset on stratum change (Layer 1) ───────────────────────────
     # When the resolver changes the stratum, anchor expected_dist_m values in
-    # the rebuilt trajectory are recomputed for the new altitude.  Clearing the
+    # the rebuilt trajectory are recomputed for the new altitude. Clearing the
     # per-drone WLS state ensures the GPS-denied module starts clean and doesn't
-    # carry over residuals from the old altitude.
+    # carry over stale residuals from the old altitude.
     if resolution_label.startswith('LAYER1_STRATUM'):
         _wls_state.pop(drone_id, None)
         _wls_wp_idx.pop(drone_id, None)

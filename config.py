@@ -15,7 +15,7 @@ DRONE_TURN_MAX_G   = 1.5   # g     — max lateral acceleration in a banked turn
 
 # Kinematic constants — fixed for all drones for consistent CPA math
 DRONE_CLIMB_RATE   = 3.0   # m/s vertical ascent
-DRONE_DESCENT_RATE = 2.0   # m/s vertical 
+DRONE_DESCENT_RATE = 2.0   # m/s vertical
 
 
 # ── Altitude stratification (direction-exclusive) ─────────────────────────────
@@ -127,22 +127,54 @@ CONFLICT_CHECK_INTERVAL  = 5.0
 WS_HEARTBEAT_INTERVAL    = 30
 
 # ── GPS-Denied / UWB Ranging ──────────────────────────────────────────────────
-# Noise model:  σᵢ = UWB_SIGMA_0 + UWB_DRIFT_K * d̂ᵢ
-# Represents physical UWB radio ranging uncertainty growing with distance.
-UWB_SIGMA_0       = 0.5     # m — constant floor noise (GPS-denied)
+# Noise model:  σᵢ = UWB_SIGMA_0 + UWB_DRIFT_K × d̂ᵢ
+# At city scale the dominant noise is distance-proportional.  Examples:
+#   d =  5 km  →  σ ≈  0.5 + 0.005 × 5000  =  25.5 m
+#   d = 15 km  →  σ ≈  0.5 + 0.005 × 15000 =  75.5 m
+#   d = 26 km  →  σ ≈  0.5 + 0.005 × 26000 = 130.5 m
+# These large σ values flow directly into the WLS weight matrix
+#   wᵢ = 1/σᵢ²
+# so distant towers are de-weighted automatically; the solver remains
+# numerically stable at any range.
+UWB_SIGMA_0       = 0.5     # m — constant floor noise
 UWB_DRIFT_K       = 0.005   # m/m — distance-proportional noise (0.5% of range)
 
-# Anchor selection per waypoint
-ANCHOR_MAX_RANGE  = 2500.0  # m — ranging radius; 2.5 km suits the 25-node SF grid
-ANCHOR_MIN_COUNT  = 4       # minimum nodes required for a valid WLS fix
-ANCHOR_MAX_COUNT  = 6       # maximum nodes used per waypoint (GDOP-optimised)
+# ── Anchor selection (10-tower city-wide infrastructure) ──────────────────────
+# With only 10 fixed towers covering a 44 × 28 km operational area, every
+# tower is "visible" from any point in the city.  ANCHOR_MAX_RANGE is set to
+# 100 km (>> diagonal of ~52 km) so select_anchors always returns all 10.
+#
+# ANCHOR_MAX_COUNT = 10 caps the system at the physical tower count.
+# ANCHOR_MIN_COUNT = 4  is the minimum for an over-determined 3-D fix (the
+# same constraint as GPS, which needs ≥4 satellites).
+ANCHOR_MAX_RANGE  = 100_000.0  # m — 100 km; all 10 towers always reachable
+ANCHOR_MIN_COUNT  = 4          # minimum nodes for a valid 3-D WLS fix
+ANCHOR_MAX_COUNT  = 10         # hard cap = total tower count
 
-# GDOP thresholds — split into horizontal and vertical components
-HDOP_THRESHOLD    = 3.0     # above this: fall back to dead reckoning (horizontal)
-VDOP_THRESHOLD    = 3.0     # above this: zero out vertical correction (use baro)
+# ── GDOP thresholds ───────────────────────────────────────────────────────────
+# HORIZONTAL (HDOP)
+#   With 10 towers spanning the city, HDOP stays below 0.85 everywhere in
+#   the operational area (verified by grid sweep).  Threshold = 3.0 gives
+#   comfortable headroom; WLS horizontal corrections are always applied.
+HDOP_THRESHOLD    = 3.0
 
-# WLS correction parameters
-WLS_CORRECTION_TAU = 3.0    # s — time window to apply velocity correction
+# VERTICAL (VDOP)
+#   Ground-based ranging geometry at city scale makes VDOP >> 3.0 for most
+#   drone positions.  This is a fundamental physics limitation: with all
+#   towers at 15–145 m and drones at 30–120 m, the vertical component of
+#   every unit-direction vector is O(0.001–0.006) at 10–26 km range.
+#   H^T H is near-singular in Z — VDOP climbs into the dozens or hundreds.
+#
+#   Correct behaviour: when VDOP > VDOP_THRESHOLD the solver zeroes Δz and
+#   the barometric altimeter holds altitude (already implemented in
+#   gps_denied.py).  VDOP_THRESHOLD is raised to 200.0 so the solver still
+#   ATTEMPTS a vertical correction for the rare cases where a drone is very
+#   close to one of the high-altitude towers (T02/T04/T06/T08/T10 at 130–145 m)
+#   and local geometry briefly improves VDOP.
+VDOP_THRESHOLD    = 200.0   # baro fallback kicks in above this
+
+# ── WLS correction parameters ─────────────────────────────────────────────────
+WLS_CORRECTION_TAU = 3.0    # s — time window over which Δp correction fades
 
 # ── Legacy ────────────────────────────────────────────────────────────────────
 HORIZONTAL_SEPARATION = CPA_R_BASE
